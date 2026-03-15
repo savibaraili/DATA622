@@ -1,0 +1,80 @@
+---
+title: "DATA 622 — Project Proposal"
+author: "Sabina Baraili"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  echo: false
+---
+
+## Project Title
+**Predicting Customer Subscription Response for Bank Marketing Campaigns**
+
+## 1. Problem Statement
+This project proposes a supervised machine learning workflow to predict whether a customer will subscribe to a term deposit after a marketing contact. The goal is to build and compare classification models that can improve campaign targeting efficiency.
+
+## 2. Motivation and Value
+Marketing teams need to prioritize likely responders to reduce outreach cost and increase conversion. A reliable classifier can:
+
+- improve precision in targeting,
+- reduce wasted contacts,
+- support better lift over random outreach.
+
+## 3. Dataset
+For consistency with course direction and prior homework context, this proposal uses the publicly available bank marketing dataset used in class labs.
+
+Candidate source:
+- https://raw.githubusercontent.com/georgehagstrom/DATA622Spring2026/main/website/assignments/labs/labData/bank_marketing_dataset.csv
+
+Target variable:
+- `y` (subscription outcome, binary)
+
+## 4. Planned Methods
+I will implement and compare at least the following models:
+
+1. Logistic Regression (baseline)
+2. Tree-based model (Random Forest or Gradient Boosting)
+3. Naive Bayes (lightweight probabilistic baseline)
+
+Potential extension (time permitting): XGBoost/LightGBM with calibration.
+
+## 5. Data Preparation Plan
+- Handle missing values and category normalization.
+- One-hot encode categorical variables.
+- Standardize numeric variables where needed.
+- Train/validation split with fixed random seed for reproducibility.
+- Class imbalance checks and mitigation if required (class weights/threshold tuning).
+
+## 6. Evaluation Plan
+Primary metrics:
+- ROC-AUC
+- PR-AUC
+- F1-score
+- Precision/Recall at selected thresholds
+
+Business-facing checks:
+- Lift at top decile
+- Confusion matrix at operational threshold
+
+## 7. Deliverables
+- Reproducible notebook/report with full pipeline
+- Model comparison table
+- Final selected model + rationale
+- Prediction/targeting recommendations
+
+## 8. Timeline
+- Week 1: data audit + preprocessing baseline
+- Week 2: model training and comparison
+- Week 3: thresholding, calibration, and final write-up
+- Week 4: polish and MVP/demo prep
+
+## 9. Risks and Mitigations
+- **Data leakage risk** → strict split discipline and pipeline-based transforms.
+- **Class imbalance** → threshold tuning and alternative metrics beyond accuracy.
+- **Overfitting** → cross-validation and regularization/hyperparameter controls.
+
+## 10. Reproducibility Notes
+- Use fixed seeds and explicit package versions.
+- Keep scripts and rendered outputs versioned (`-v###`) for submission traceability.

@@ -1,0 +1,383 @@
+---
+title: "DATA 622 — Homework 3: Classification"
+author: "Sabina Baraili"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    geometry: margin=1in
+execute:
+  echo: false
+  warning: false
+  message: false
+  fig-width: 6
+  fig-height: 4
+jupyter: python3
+---
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import GaussianNB
+from sklearn.metrics import roc_curve, roc_auc_score, brier_score_loss, log_loss
+from sklearn.calibration import calibration_curve
+sns.set_theme(style="whitegrid")
+RANDOM_STATE = 622
+```
+
+## Data Source Justification
+This assignment explicitly directs students to the course lab dataset for the Bank Marketing classification task. I use the course-provided dataset (`bank_marketing_dataset.csv`) because it is the canonical source for this homework and is accompanied by the official dictionary and lab prompt.
+
+Why this source is appropriate:
+- **Matches assignment scope** (classification for marketing targeting).
+- **Supports all required analyses** (EDA, temporal drift, epoch evaluation, ROC/calibration, lift/hit-rate).
+- **Ensures reproducibility** against instructor references.
+- **Avoids scope drift** from alternative datasets with incompatible variables.
+
+## 1) Data and setup
+
+```{python}
+url = "https://raw.githubusercontent.com/georgehagstrom/DATA622Spring2026/main/website/assignments/labs/labData/bank_marketing_dataset.csv"
+df = pd.read_csv(url)
+
+df[['y']].head()
+```
+
+```{python}
+# target normalization
+if 'y' in df.columns:
+    df['y'] = df['y'].map({'yes':1,'no':0}).fillna(df['y']).astype(int)
+
+# temporal vars (used for epochs only; excluded as predictors)
+for col in ['year','month_numeric','day']:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+print(df.shape)
+print(df['y'].value_counts(normalize=True))
+```
+
+## 2) Problem 1 — Kaggle flaw (short answer)
+
+A common flaw in top notebooks is **using post-contact leakage variables** (especially call `duration`) when modeling pre-call targeting decisions. That produces inflated performance but is not actionable at call-selection time.
+
+## 3) Problem 2 — EDA, baseline, epochs, drift
+
+```{python}
+# train/test split with stratification on y
+train_df, test_df = train_test_split(
+    df, test_size=0.25, random_state=RANDOM_STATE, stratify=df['y']
+)
+
+# build epochs from year-month when available
+if {'year','month_numeric'}.issubset(test_df.columns):
+    test_df = test_df.copy()
+    test_df['time_index'] = test_df['year']*100 + test_df['month_numeric']
+    test_df['epoch'] = pd.qcut(test_df['time_index'], q=4, duplicates='drop')
+else:
+    # fallback: quantile split by row order
+    test_df = test_df.copy().reset_index(drop=True)
+    test_df['epoch'] = pd.qcut(test_df.index, q=4, duplicates='drop')
+
+# compact epoch labels for cleaner tables/plots in PDF
+epoch_vals = sorted(test_df['epoch'].astype(str).unique())
+epoch_map = {v: f"E{i+1}" for i, v in enumerate(epoch_vals)}
+test_df['epoch_label'] = test_df['epoch'].astype(str).map(epoch_map)
+
+test_df['epoch_label'].value_counts().sort_index()
+```
+
+```{python}
+# Exclude leakage/temporal columns from predictors
+exclude_cols = {'y', 'duration', 'month_numeric', 'day', 'year'}
+features = [c for c in df.columns if c not in exclude_cols]
+
+X_train = train_df[features]
+y_train = train_df['y']
+X_test = test_df[features]
+y_test = test_df['y']
+
+cat_cols = X_train.select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
+num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+
+preprocess = ColumnTransformer([
+    ('num', Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ]), num_cols),
+    ('cat', Pipeline([
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('ohe', OneHotEncoder(handle_unknown='ignore'))
+    ]), cat_cols)
+])
+
+baseline = Pipeline([
+    ('prep', preprocess),
+    ('clf', LogisticRegression(max_iter=3000))
+])
+
+_ = baseline.fit(X_train, y_train)
+```
+
+```{python}
+def lift_hit_table(y_true, p, cuts=(0.1, 0.5)):
+    out = []
+    base_rate = y_true.mean()
+    rank = np.argsort(-p)
+    ys = y_true.iloc[rank].reset_index(drop=True)
+    n = len(ys)
+    for c in cuts:
+        k = max(1, int(np.floor(c*n)))
+        hit = ys.iloc[:k].mean()
+        lift = hit/base_rate if base_rate > 0 else np.nan
+        out.append({'top_pct': c, 'hit_rate': hit, 'lift': lift})
+    return pd.DataFrame(out)
+
+def eval_epoch(name, y_true, p):
+    auc = roc_auc_score(y_true, p)
+    brier = brier_score_loss(y_true, p)
+    ll = log_loss(y_true, p)
+    err = ((p >= 0.5).astype(int) != y_true).mean()
+    return {'epoch': str(name), 'n': len(y_true), 'base_success': y_true.mean(), 'error_rate': err, 'auc': auc, 'brier': brier, 'log_loss': ll}
+```
+
+```{python}
+# Evaluate by epoch + overall
+rows = []
+lift_tables = {}
+
+p_all = baseline.predict_proba(X_test)[:,1]
+rows.append(eval_epoch('ALL', y_test, p_all))
+lift_tables['ALL'] = lift_hit_table(y_test.reset_index(drop=True), pd.Series(p_all))
+
+for ep in sorted(test_df['epoch_label'].unique()):
+    m = test_df['epoch_label'] == ep
+    Xt = X_test.loc[m]
+    yt = y_test.loc[m]
+    pt = baseline.predict_proba(Xt)[:,1]
+    rows.append(eval_epoch(ep, yt, pt))
+    lift_tables[ep] = lift_hit_table(yt.reset_index(drop=True), pd.Series(pt))
+
+epoch_metrics = pd.DataFrame(rows)
+epoch_metrics[['epoch','n','base_success','error_rate','auc','brier','log_loss']].round(4)
+```
+
+```{python}
+# ROC curves by epoch
+plt.figure(figsize=(8,6))
+for ep in sorted(test_df['epoch_label'].unique()):
+    m = test_df['epoch_label'] == ep
+    pt = baseline.predict_proba(X_test.loc[m])[:,1]
+    fpr, tpr, _ = roc_curve(y_test.loc[m], pt)
+    auc = roc_auc_score(y_test.loc[m], pt)
+    plt.plot(fpr, tpr, label=f"{ep} (AUC={auc:.3f})")
+
+fpr, tpr, _ = roc_curve(y_test, p_all)
+plt.plot(fpr, tpr, 'k--', label=f"ALL (AUC={roc_auc_score(y_test,p_all):.3f})")
+plt.plot([0,1],[0,1],':', color='gray')
+plt.xlabel('FPR'); plt.ylabel('TPR'); plt.title('ROC by Epoch')
+plt.legend()
+plt.show()
+```
+
+```{python}
+# Calibration by epoch
+plt.figure(figsize=(8,6))
+for ep in sorted(test_df['epoch_label'].unique()):
+    m = test_df['epoch_label'] == ep
+    pt = baseline.predict_proba(X_test.loc[m])[:,1]
+    frac_pos, mean_pred = calibration_curve(y_test.loc[m], pt, n_bins=10)
+    plt.plot(mean_pred, frac_pos, marker='o', label=str(ep))
+
+plt.plot([0,1],[0,1],':', color='gray')
+plt.xlabel('Predicted probability'); plt.ylabel('Observed frequency')
+plt.title('Calibration by Epoch')
+plt.legend()
+plt.show()
+```
+
+```{python}
+# Lift curves
+plt.figure(figsize=(8,6))
+for ep, t in lift_tables.items():
+    xs = [r/100 for r in range(1,101)]
+    # smooth estimate using sorted probabilities per epoch
+    if ep == 'ALL':
+        yt = y_test.reset_index(drop=True)
+        pt = pd.Series(p_all)
+    else:
+        m = test_df['epoch_label'] == ep
+        yt = y_test.loc[m].reset_index(drop=True)
+        pt = pd.Series(baseline.predict_proba(X_test.loc[m])[:,1])
+    rank = np.argsort(-pt.values)
+    ys = yt.iloc[rank].reset_index(drop=True)
+    base = ys.mean()
+    lifts = []
+    n = len(ys)
+    for x in xs:
+        k = max(1, int(np.floor(x*n)))
+        lifts.append(ys.iloc[:k].mean()/base if base>0 else np.nan)
+    plt.plot(xs, lifts, label=str(ep))
+
+plt.xlabel('Top x% targeted')
+plt.ylabel('Lift')
+plt.title('Lift Curves by Epoch')
+plt.legend()
+plt.show()
+```
+
+```{python}
+# concise table for top 10% and top 50%
+out = []
+for ep, tab in lift_tables.items():
+    x = tab.copy()
+    x['epoch'] = ep
+    out.append(x)
+pd.concat(out, ignore_index=True)
+```
+
+## 4) Problem 3 — Interpretation
+
+```{python}
+# Fit logistic directly for coefficient extraction
+Xtr_prep = preprocess.fit_transform(X_train)
+Xte_prep = preprocess.transform(X_test)
+
+feature_names = preprocess.get_feature_names_out()
+logit = LogisticRegression(max_iter=3000)
+_ = logit.fit(Xtr_prep, y_train)
+
+coefs = pd.DataFrame({
+    'feature': feature_names,
+    'coef': logit.coef_.ravel()
+})
+coefs['odds_ratio'] = np.exp(coefs['coef'])
+coefs['feature'] = coefs['feature'].astype(str).str.slice(0, 42)
+coefs['odds_ratio'] = coefs['odds_ratio'].round(3)
+
+top_pos = coefs.sort_values('odds_ratio', ascending=False).head(10)[['feature','odds_ratio']]
+top_neg = coefs.sort_values('odds_ratio', ascending=True).head(10)[['feature','odds_ratio']]
+
+print("Top positive odds-ratio predictors")
+display(top_pos)
+print("Top negative odds-ratio predictors")
+display(top_neg)
+```
+
+### Marginal effects for contact method (cellular vs telephone baseline)
+
+```{python}
+def avg_contact_effect(model, X, contact_col='contact', baseline='telephone'):
+    # Average predicted probability difference if everyone had contact=level vs baseline
+    if contact_col not in X.columns:
+        return pd.DataFrame({'contact_level': ['not_available'], 'avg_marginal_effect_vs_telephone': [np.nan]})
+
+    levels = sorted(X[contact_col].dropna().astype(str).unique())
+    rows = []
+
+    X_base = X.copy()
+    X_base[contact_col] = baseline
+    p_base = model.predict_proba(X_base)[:, 1]
+
+    for lv in levels:
+        X_lv = X.copy()
+        X_lv[contact_col] = lv
+        p_lv = model.predict_proba(X_lv)[:, 1]
+        rows.append({
+            'contact_level': lv,
+            'avg_marginal_effect_vs_telephone': float(np.mean(p_lv - p_base))
+        })
+
+    return pd.DataFrame(rows)
+
+marginal_tables = []
+for ep in sorted(test_df['epoch_label'].unique()):
+    m = test_df['epoch_label'] == ep
+    eff = avg_contact_effect(baseline, X_test.loc[m], contact_col='contact', baseline='telephone')
+    eff['epoch'] = ep
+    marginal_tables.append(eff)
+
+marginal_effects = pd.concat(marginal_tables, ignore_index=True)
+marginal_effects.round(4)
+```
+
+## 5) Problem 4 — Compare with alternative model (Naive Bayes)
+
+```{python}
+# Naive Bayes on one-hot transformed features
+nb = GaussianNB()
+_ = nb.fit(Xtr_prep.toarray() if hasattr(Xtr_prep, 'toarray') else Xtr_prep, y_train)
+
+p_nb = nb.predict_proba(Xte_prep.toarray() if hasattr(Xte_prep, 'toarray') else Xte_prep)[:,1]
+
+# Per-epoch comparison by log score
+model_epoch_rows = []
+for ep in sorted(test_df['epoch_label'].unique()):
+    m = test_df['epoch_label'] == ep
+    y_ep = y_test.loc[m]
+
+    p_lr_ep = baseline.predict_proba(X_test.loc[m])[:,1]
+    p_nb_ep = nb.predict_proba((Xte_prep[m.values].toarray() if hasattr(Xte_prep, 'toarray') else Xte_prep[m.values]))[:,1]
+
+    model_epoch_rows.append({'epoch': ep, 'model': 'Logistic', 'log_loss': log_loss(y_ep, p_lr_ep), 'auc': roc_auc_score(y_ep, p_lr_ep)})
+    model_epoch_rows.append({'epoch': ep, 'model': 'NaiveBayes', 'log_loss': log_loss(y_ep, p_nb_ep), 'auc': roc_auc_score(y_ep, p_nb_ep)})
+
+model_epoch_compare = pd.DataFrame(model_epoch_rows)
+model_epoch_compare.round(4)
+```
+
+```{python}
+# winner by epoch (lower log_loss is better)
+winners = model_epoch_compare.sort_values(['epoch', 'log_loss']).groupby('epoch', as_index=False).first()
+winners
+```
+
+```{python}
+# Lift/hit rate by epoch for both models (top 10% and top 50%)
+lift_rows = []
+for ep in sorted(test_df['epoch_label'].unique()):
+    m = test_df['epoch_label'] == ep
+    y_ep = y_test.loc[m].reset_index(drop=True)
+
+    p_lr_ep = baseline.predict_proba(X_test.loc[m])[:,1]
+    p_nb_ep = nb.predict_proba((Xte_prep[m.values].toarray() if hasattr(Xte_prep, 'toarray') else Xte_prep[m.values]))[:,1]
+
+    t_lr = lift_hit_table(y_ep, pd.Series(p_lr_ep)); t_lr['model'] = 'Logistic'; t_lr['epoch'] = ep
+    t_nb = lift_hit_table(y_ep, pd.Series(p_nb_ep)); t_nb['model'] = 'NaiveBayes'; t_nb['epoch'] = ep
+
+    lift_rows.extend([t_lr, t_nb])
+
+lift_epoch_compare = pd.concat(lift_rows, ignore_index=True)
+lift_epoch_compare[['epoch','model','top_pct','hit_rate','lift']].round(4)
+```
+
+## 6) Conclusions (plain-language summary)
+
+```{python}
+best_overall = compare = pd.DataFrame([
+    {'model':'Logistic', 'auc':roc_auc_score(y_test,p_all), 'brier':brier_score_loss(y_test,p_all), 'log_loss':log_loss(y_test,p_all)},
+    {'model':'NaiveBayes', 'auc':roc_auc_score(y_test,p_nb), 'brier':brier_score_loss(y_test,p_nb), 'log_loss':log_loss(y_test,p_nb)}
+]).sort_values('log_loss').iloc[0]
+
+print("Best overall model by log-loss:", best_overall['model'])
+print("AUC:", round(best_overall['auc'], 4), "| Log-loss:", round(best_overall['log_loss'], 4))
+
+print("\nEpoch winners by log-loss:")
+print(winners.to_string(index=False))
+
+summary_lift = lift_epoch_compare.sort_values(['epoch','model','top_pct']).copy()
+summary_lift[['top_pct','hit_rate','lift']] = summary_lift[['top_pct','hit_rate','lift']].round(3)
+print("\nLift/Hit summary (top 10% and 50%):")
+print(summary_lift.to_string(index=False))
+```
+
+In short: temporal drift is real in this dataset, so a single pooled score can hide performance swings. Evaluating by epoch gives a more realistic view of campaign risk. For operations, prioritize the model with consistently better epoch-level log-loss and use lift/hit-rate at top 10% and 50% targeting to set campaign size.
