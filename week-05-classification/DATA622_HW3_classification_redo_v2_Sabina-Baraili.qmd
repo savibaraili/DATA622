@@ -1,0 +1,528 @@
+---
+title: "DATA 622 Homework 3 Redo Revision 2: Classification"
+author: "Sabina Baraili"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    geometry: margin=1in
+execute:
+  echo: false
+  warning: false
+  message: false
+  fig-width: 7
+  fig-height: 4.5
+jupyter: python3
+---
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.calibration import calibration_curve
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score, roc_curve
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+sns.set_theme(style="whitegrid", context="notebook")
+RANDOM_STATE = 622
+```
+
+```{python}
+def show_df(df, digits=4):
+    display(df.round(digits))
+
+
+def format_month_axis(ax, labels):
+    ticks = np.arange(len(labels))
+    step = max(1, len(labels) // 8)
+    keep = ticks[::step]
+    ax.set_xticks(keep)
+    ax.set_xticklabels([labels[i] for i in keep], rotation=45, ha="right")
+
+
+def lift_hit_table(y_true, p, cuts=(0.1, 0.5)):
+    base_rate = y_true.mean()
+    order = np.argsort(-p)
+    ranked_y = y_true.iloc[order].reset_index(drop=True)
+
+    rows = []
+    for cut in cuts:
+        k = max(1, int(np.floor(cut * len(ranked_y))))
+        hit_rate = ranked_y.iloc[:k].mean()
+        rows.append(
+            {
+                "top_pct": cut,
+                "hit_rate": hit_rate,
+                "lift": hit_rate / base_rate,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def metric_row(epoch_name, y_true, p):
+    return {
+        "epoch": epoch_name,
+        "n": len(y_true),
+        "campaign_success_rate": y_true.mean(),
+        "error_rate_0_5": (((p >= 0.5).astype(int)) != y_true).mean(),
+        "auc": roc_auc_score(y_true, p),
+        "brier": brier_score_loss(y_true, p),
+        "log_loss": log_loss(y_true, p),
+    }
+
+
+def average_contact_effect(model, X, level, baseline="telephone"):
+    x_base = X.copy()
+    x_base["contact"] = baseline
+    p_base = model.predict_proba(x_base)[:, 1]
+
+    x_level = X.copy()
+    x_level["contact"] = level
+    p_level = model.predict_proba(x_level)[:, 1]
+
+    return float(np.mean(p_level - p_base))
+```
+
+## Problem 1
+
+The flaw in the highly upvoted Kaggle notebook is that it uses `duration` as a predictor. That variable is only known after the call has happened, so it leaks post-contact information into what is supposed to be a pre-contact targeting model. The reported performance therefore overstates what the bank could actually achieve when deciding whom to call.
+
+### Interpretation
+
+The Kaggle model may look accurate, but it answers the wrong business question. A valid targeting model must rely only on information available before the call starts.
+
+## Problem 2
+
+### Data preparation and split
+
+```{python}
+df = pd.read_csv("bank_marketing_dataset.csv").copy()
+df = df.rename(columns={"Unnamed: 0": "row_id"})
+
+df["y"] = (df["y"] == "yes").astype(int)
+df["ym"] = df["year"] * 100 + df["month_numeric"]
+df["month_date"] = pd.to_datetime(
+    dict(year=df["year"], month=df["month_numeric"], day=1)
+)
+
+train_df, test_df = train_test_split(
+    df,
+    test_size=0.25,
+    random_state=RANDOM_STATE,
+    stratify=df["y"]
+)
+
+split_summary = pd.DataFrame(
+    {
+        "split": ["train", "test"],
+        "n": [len(train_df), len(test_df)],
+        "success_rate": [train_df["y"].mean(), test_df["y"].mean()],
+    }
+)
+
+show_df(split_summary)
+```
+
+I used a stratified train-test split on `y` because the positive class is rare overall, about 11.7%, and the baseline and refined models should start from comparable class balance in training and testing. I excluded `duration` from every model because it is post-contact leakage. I also excluded `year`, `month_numeric`, and `day` from the baseline predictors because the assignment explicitly asks for a non-temporal baseline model. Finally, I treat `row_id` as an exported observation index rather than a meaningful business feature.
+
+This is still a random split, not a strict forward-in-time holdout. I use it here for comparability with the assignment workflow while diagnosing drift through epoch-specific evaluation, but in production a chronological split would be the stricter design because it better matches future prediction.
+
+### Exploratory data analysis
+
+```{python}
+monthly = (
+    df.groupby(["year", "month_numeric", "month_date"], as_index=False)
+    .agg(
+        n=("y", "size"),
+        success_rate=("y", "mean"),
+        euribor3m=("euribor3m", "mean"),
+        emp_var_rate=("emp.var.rate", "mean"),
+        nr_employed=("nr.employed", "mean"),
+    )
+    .sort_values("month_date")
+)
+monthly["label"] = monthly["month_date"].dt.strftime("%Y-%m")
+
+contact_mix = (
+    df.groupby(["year", "month_numeric", "month_date", "contact"], as_index=False)
+    .size()
+    .rename(columns={"size": "n"})
+    .sort_values(["month_date", "contact"])
+)
+contact_mix["label"] = contact_mix["month_date"].dt.strftime("%Y-%m")
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+sns.barplot(data=monthly, x="label", y="n", color="#4C78A8", ax=axes[0])
+axes[0].set_title("Monthly Call Volume")
+axes[0].set_xlabel("Year-Month")
+axes[0].set_ylabel("Observations")
+format_month_axis(axes[0], monthly["label"].tolist())
+
+sns.lineplot(
+    data=monthly,
+    x="label",
+    y="success_rate",
+    marker="o",
+    color="#F58518",
+    ax=axes[1]
+)
+axes[1].set_title("Monthly Campaign Success Rate")
+axes[1].set_xlabel("Year-Month")
+axes[1].set_ylabel("Success Rate")
+format_month_axis(axes[1], monthly["label"].tolist())
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+sns.lineplot(
+    data=monthly,
+    x="label",
+    y="euribor3m",
+    marker="o",
+    color="#54A24B",
+    ax=axes[0]
+)
+axes[0].set_title("Euribor Over Time")
+axes[0].set_xlabel("Year-Month")
+axes[0].set_ylabel("euribor3m")
+format_month_axis(axes[0], monthly["label"].tolist())
+
+sns.lineplot(
+    data=monthly,
+    x="label",
+    y="emp_var_rate",
+    marker="o",
+    color="#E45756",
+    ax=axes[1],
+    label="emp.var.rate"
+)
+sns.lineplot(
+    data=monthly,
+    x="label",
+    y="nr_employed",
+    marker="o",
+    color="#72B7B2",
+    ax=axes[1],
+    label="nr.employed"
+)
+axes[1].set_title("Macro Conditions Over Time")
+axes[1].set_xlabel("Year-Month")
+axes[1].set_ylabel("Level")
+format_month_axis(axes[1], monthly["label"].tolist())
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+plt.figure(figsize=(13, 4.5))
+sns.barplot(
+    data=contact_mix,
+    x="label",
+    y="n",
+    hue="contact",
+    estimator=sum,
+    errorbar=None
+)
+plt.title("Contact Method Mix by Month")
+plt.xlabel("Year-Month")
+plt.ylabel("Observations")
+format_month_axis(plt.gca(), monthly["label"].tolist())
+plt.legend(title="contact")
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+top_category_tables = {}
+
+for col in ["contact", "poutcome", "housing", "loan", "education", "job"]:
+    tab = (
+        df.groupby(col)["y"]
+        .agg(success_rate="mean", n="size")
+        .sort_values(["success_rate", "n"], ascending=[False, False])
+        .reset_index()
+    )
+    top_category_tables[col] = tab
+
+category_snapshot = pd.concat(
+    [
+        top_category_tables["contact"].head(3).rename(columns={"contact": "level"}).assign(variable="contact"),
+        top_category_tables["poutcome"].head(3).rename(columns={"poutcome": "level"}).assign(variable="poutcome"),
+        top_category_tables["housing"].head(2).rename(columns={"housing": "level"}).assign(variable="housing"),
+    ],
+    ignore_index=True
+)[["variable", "level", "success_rate", "n"]]
+
+show_df(category_snapshot)
+```
+
+The EDA supports four important conclusions.
+
+1. The dataset is strongly non-stationary over time. Monthly call volume is highest in 2008, while campaign success rates rise sharply in 2009 and 2010.
+2. The composition of the contacted population changes over time. Early months rely heavily on `contact = unknown`, while later months use much more `cellular` and `telephone`.
+3. The macro variables move at the same time as the target rate. `euribor3m` and `emp.var.rate` fall dramatically as campaign success rises, which suggests that changing economic conditions affected customer response.
+4. Several non-temporal predictors are meaningfully related to conversion, especially `poutcome`, `contact`, and loan or housing status.
+
+### Interpretation
+
+The bank is not operating in one stable environment. The success rate, the contact mix, and the macroeconomic backdrop all change materially over time, so a single pooled evaluation is likely to conceal real differences in model usefulness across periods.
+
+### Defining epochs
+
+The assignment asks for epochs that reflect the temporal structure of the data, so I defined them directly from the monthly EDA rather than by automatic quantiles. The breakpoints align with visible shifts in success rates, contact mix, and macro conditions.
+
+More specifically, I chose boundaries immediately after visible changes in the month-level success-rate curve and contact composition so that each epoch represents an interpretable business regime rather than an equal-sized bin. The goal is not to force balanced sample sizes, but to separate distinct periods that the EDA suggests behave differently.
+
+In the monthly plots, the main regime changes appear around August 2008, May 2009, and December 2009, so those visible shifts motivate the chosen cut points.
+
+This implementation is deterministic. The source code uses one fixed set of manually chosen epoch cut points and does not include any fallback rule based on row order or quantiles. Also, `September 2008` does not appear in the dataset, so the second epoch begins in `October 2008` because that is the next observed month.
+
+```{python}
+epoch_bins = [0, 200808, 200905, 200912, 999999]
+epoch_codes = ["E1", "E2", "E3", "E4"]
+epoch_windows = [
+    "May 2008-Aug 2008",
+    "Oct 2008-May 2009",
+    "Jun 2009-Dec 2009",
+    "Jan 2010-Nov 2010",
+]
+
+df["epoch"] = pd.cut(df["ym"], bins=epoch_bins, labels=epoch_codes, right=True)
+train_df["epoch"] = pd.cut(train_df["ym"], bins=epoch_bins, labels=epoch_codes, right=True)
+test_df["epoch"] = pd.cut(test_df["ym"], bins=epoch_bins, labels=epoch_codes, right=True)
+
+epoch_definition_table = pd.DataFrame(
+    {
+        "epoch": epoch_codes,
+        "window": epoch_windows,
+    }
+)
+
+epoch_summary = (
+    epoch_definition_table.merge(
+        pd.DataFrame(
+            {
+                "epoch": df["epoch"].value_counts().sort_index().index.astype(str),
+                "dataset_n": df["epoch"].value_counts().sort_index().values,
+                "test_n": test_df["epoch"].value_counts().sort_index().values,
+                "test_success_rate": (
+                    test_df.groupby("epoch", observed=False)["y"].mean().sort_index().values
+                ),
+            }
+        ),
+        on="epoch",
+        how="left"
+    )
+)
+
+show_df(epoch_summary)
+```
+
+These bins are not arbitrary. `E1` is the early low-conversion, heavy-volume period; `E2` is the transition period; `E3` is the high-conversion period after the strongest macro shift; and `E4` is the final high-conversion regime. Evaluating by epoch is more informative than reporting only a pooled test statistic because the marketing team experiences these conditions separately, not all at once.
+
+The epochs are also intentionally unequal in size because the underlying business regimes are unequal in duration. That means the later-epoch metrics should be interpreted with a little more sampling noise than the larger early-period estimates.
+
+### Baseline logistic regression model
+
+```{python}
+baseline_features = [
+    c for c in df.columns
+    if c not in {"y", "duration", "month_numeric", "day", "year", "ym", "month_date", "epoch"}
+]
+
+X_train = train_df[baseline_features]
+y_train = train_df["y"]
+X_test = test_df[baseline_features]
+y_test = test_df["y"]
+
+cat_cols = X_train.select_dtypes(include=["object", "category", "bool", "string"]).columns.tolist()
+num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+
+preprocess = ColumnTransformer(
+    transformers=[
+        (
+            "num",
+            Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler()),
+                ]
+            ),
+            num_cols,
+        ),
+        (
+            "cat",
+            Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("ohe", OneHotEncoder(handle_unknown="ignore")),
+                ]
+            ),
+            cat_cols,
+        ),
+    ]
+)
+
+baseline_model = Pipeline(
+    steps=[
+        ("prep", preprocess),
+        ("clf", LogisticRegression(max_iter=4000, random_state=RANDOM_STATE)),
+    ]
+)
+
+_ = baseline_model.fit(X_train, y_train)
+```
+
+```{python}
+baseline_rows = []
+baseline_lifts = []
+
+p_all = baseline_model.predict_proba(X_test)[:, 1]
+baseline_rows.append(metric_row("ALL", y_test, p_all))
+
+for ep in epoch_codes:
+    m = test_df["epoch"] == ep
+    yt = y_test.loc[m]
+    pt = baseline_model.predict_proba(X_test.loc[m])[:, 1]
+    baseline_rows.append(metric_row(ep, yt, pt))
+
+    lift_tab = lift_hit_table(yt.reset_index(drop=True), pd.Series(pt))
+    lift_tab["epoch"] = ep
+    baseline_lifts.append(lift_tab)
+
+baseline_metrics = pd.DataFrame(baseline_rows)
+baseline_lift_table = pd.concat(baseline_lifts, ignore_index=True)
+
+show_df(baseline_metrics)
+show_df(baseline_lift_table[["epoch", "top_pct", "hit_rate", "lift"]])
+```
+
+```{python}
+fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+axes = axes.ravel()
+
+for ax, ep in zip(axes, epoch_codes):
+    m = test_df["epoch"] == ep
+    pt = baseline_model.predict_proba(X_test.loc[m])[:, 1]
+    fpr, tpr, _ = roc_curve(y_test.loc[m], pt)
+    auc = roc_auc_score(y_test.loc[m], pt)
+    ax.plot(fpr, tpr, color="#4C78A8", label=f"AUC = {auc:.3f}")
+    ax.plot([0, 1], [0, 1], linestyle=":", color="gray")
+    ax.set_title(ep)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.legend(loc="lower right")
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+axes = axes.ravel()
+
+for ax, ep in zip(axes, epoch_codes):
+    m = test_df["epoch"] == ep
+    pt = baseline_model.predict_proba(X_test.loc[m])[:, 1]
+    frac_pos, mean_pred = calibration_curve(y_test.loc[m], pt, n_bins=10)
+    ax.plot(mean_pred, frac_pos, marker="o", color="#F58518")
+    ax.plot([0, 1], [0, 1], linestyle=":", color="gray")
+    ax.set_title(ep)
+    ax.set_xlabel("Predicted Probability")
+    ax.set_ylabel("Observed Frequency")
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+plt.figure(figsize=(8, 5))
+
+for ep in epoch_codes:
+    m = test_df["epoch"] == ep
+    yt = y_test.loc[m].reset_index(drop=True)
+    pt = pd.Series(baseline_model.predict_proba(X_test.loc[m])[:, 1])
+
+    base_rate = yt.mean()
+    order = np.argsort(-pt.values)
+    ranked_y = yt.iloc[order].reset_index(drop=True)
+
+    xs = np.arange(1, 101) / 100
+    lifts = []
+    for x in xs:
+        k = max(1, int(np.floor(x * len(ranked_y))))
+        lifts.append(ranked_y.iloc[:k].mean() / base_rate)
+
+    plt.plot(xs, lifts, label=ep)
+
+plt.xlabel("Top x% targeted")
+plt.ylabel("Lift")
+plt.title("Baseline Lift Curves by Epoch")
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+### Interpretation
+
+The baseline results show why pooled evaluation is not enough. On the full test set, the AUC is 0.8008, which initially looks strong. But by epoch the AUC varies from 0.5900 in `E1` to 0.7627 in `E4`, and the campaign success rate shifts from 4.5% to 52.1%. That is a very different operational setting from one epoch to the next.
+
+The calibration plots tell the same story. In the early low-conversion epoch, predicted probabilities are compressed near zero and the model has limited discrimination. In the later high-conversion epochs, the model spreads probabilities more aggressively, but the underlying base rate has changed so much that pooled calibration is not a reliable summary.
+
+The lift results are more actionable than the fixed 0.5 classification threshold. In `E2`, the top 10% of scored customers has a hit rate of 28.9%, compared with a baseline campaign success rate of 10.3%, for a lift of 2.80. Even in `E1`, where discrimination is weak, targeting the top 10% still improves the hit rate from 4.5% to 7.2%.
+
+Overall, the baseline model has useful ranking value, but that value depends heavily on the regime. The central lesson from Problem 2 is that temporal drift is the main modeling issue in this dataset.
+
+## Problem 3
+
+### Odds ratios
+
+```{python}
+X_train_prepped = preprocess.fit_transform(X_train)
+feature_names = preprocess.get_feature_names_out()
+
+logit = LogisticRegression(max_iter=4000, random_state=RANDOM_STATE)
+_ = logit.fit(X_train_prepped, y_train)
+
+coef_table = pd.DataFrame(
+    {
+        "feature": feature_names,
+        "coef": logit.coef_.ravel(),
+    }
+)
+coef_table["odds_ratio"] = np.exp(coef_table["coef"])
+
+top_positive = (
+    coef_table.sort_values("odds_ratio", ascending=False)
+    .head(10)[["feature", "odds_ratio"]]
+)
+top_negative = (
+    coef_table.sort_values("odds_ratio", ascending=True)
+    .head(10)[["feature", "odds_ratio"]]
+)
+
+show_df(top_positive, digits=3)
+show_df(top_negative, digits=3)
+```
+
+### Interpretation
+
+The strongest positive predictor is `poutcome = success`, with an estimated odds ratio of about 2.50. `contact = cellular` is also favorable relative to the omitted reference level, and several macroeconomic variables remain associated with conversion even after excluding explicit time indicators.
+
+The strongest negative effect is `contact = unknown`, with an odds ratio of about 0.39. Other large negative effects include `poutcome = failure`, higher `emp.var.rate`, and `housing = yes`. These results are consistent with the EDA: customers with low-quality contact information and customers observed in less favorable macro conditions are substantially harder to convert.
+```
