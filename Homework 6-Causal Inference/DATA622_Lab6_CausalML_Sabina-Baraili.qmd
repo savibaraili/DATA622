@@ -1,0 +1,631 @@
+---
+title: "DATA 622 Lab 6: Causal ML for Orange Juice Price Elasticity"
+author: "Sabina Baraili"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    fig-width: 8
+    fig-height: 5
+    include-in-header:
+      text: |
+        \setlength{\emergencystretch}{3em}
+        \AtBeginEnvironment{longtable}{\small}
+        \AtBeginEnvironment{tabular}{\small}
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: source
+---
+
+## Setup
+
+This report follows the lab questions in order and answers each one directly using `oj_large.csv`.
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LassoCV
+from sklearn.metrics import r2_score
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+from econml.dml import CausalForestDML, LinearDML
+from econml.score import RScorer
+
+np.random.seed(2026)
+pd.set_option("display.max_columns", 50)
+pd.set_option("display.width", 140)
+
+
+def show_df(x, digits=4):
+    out = x.copy()
+    num_cols = out.select_dtypes(include=[np.number]).columns
+    out[num_cols] = out[num_cols].round(digits)
+    return out
+```
+
+## Data Setup
+
+I use the same setup as the EconML orange juice vignette:
+
+- `Y = logmove`
+- `T = log(price)`
+- `W` = all confounders except `week`, `store`, `price`, `INCOME`, and `logmove`
+- `X` = standardized `INCOME`
+
+For Problems 1 to 3, `brand` is included in `W` through one-hot encoding.
+
+```{python}
+df = pd.read_csv("oj_large.csv").copy()
+df["log_price"] = np.log(df["price"])
+
+w_num_cols = [
+    "feat", "AGE60", "EDUC", "ETHNIC", "HHLARGE", "WORKWOM",
+    "HVAL150", "SSTRDIST", "SSTRVOL", "CPDIST5", "CPWVOL5"
+]
+w_cat_cols = ["brand"]
+
+w_preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", StandardScaler(), w_num_cols),
+        ("brand", OneHotEncoder(drop="first", sparse_output=False), w_cat_cols),
+    ],
+    remainder="drop",
+)
+
+W = w_preprocessor.fit_transform(df)
+W_names = w_preprocessor.get_feature_names_out()
+
+income_scaler = StandardScaler()
+X = income_scaler.fit_transform(df[["INCOME"]])
+income_raw = df["INCOME"].to_numpy()
+
+Y = df["logmove"].to_numpy()
+T = df["log_price"].to_numpy()
+
+show_df(pd.DataFrame({
+    "Object": ["Rows", "Columns in W", "Columns in X"],
+    "Value": [len(df), W.shape[1], X.shape[1]]
+}))
+```
+
+## Quick Data Check
+
+Before fitting the models, I checked the variables used in the analysis.
+
+```{python}
+eda_summary = pd.DataFrame({
+    "Metric": [
+        "Number of rows",
+        "Missing values in price",
+        "Missing values in logmove",
+        "Missing values in INCOME",
+        "Minimum price",
+        "Maximum price",
+        "Mean log(price)",
+        "Mean logmove",
+    ],
+    "Value": [
+        len(df),
+        df["price"].isna().sum(),
+        df["logmove"].isna().sum(),
+        df["INCOME"].isna().sum(),
+        df["price"].min(),
+        df["price"].max(),
+        df["log_price"].mean(),
+        df["logmove"].mean(),
+    ],
+})
+show_df(eda_summary)
+```
+
+```{python}
+brand_eda = (
+    df.groupby("brand", as_index=False)
+    .agg(
+        observations=("brand", "size"),
+        mean_price=("price", "mean"),
+        mean_logmove=("logmove", "mean"),
+        mean_income=("INCOME", "mean"),
+        feature_rate=("feat", "mean"),
+    )
+    .sort_values("observations", ascending=False)
+)
+show_df(brand_eda)
+```
+
+**Interpretation:**  
+The main variables are present, and the three brands differ in price, sales, promotion, and income. That supports treating brand and the demographic variables as important controls.
+
+## Problem 1: Testing on Fake Data
+
+### Part 1
+
+**Question:** Build the confounder matrix `W`, the modifier matrix `X`, and simulate treatment `T_sim`.
+
+**Answer:** Using the setup above, I standardized `W`, standardized `INCOME` into `X`, and simulated `T_sim` from a sparse linear function of `W` plus noise.
+
+It is standard in causal ML to verify the procedure on synthetic outcomes first. I simulated treatment using the required structure:
+
+\[
+T_{sim} = 0.8 + W\beta_T + \varepsilon_T
+\]
+
+\[
+Y_{sim} = \tau(X)\,T_{sim} + W\beta_Y + \varepsilon_Y
+\]
+
+with
+
+$$
+\tau(X) = -2.5\tanh(2X)
+$$
+
+**Interpretation:**  
+The setup matches the lab instructions: `W` contains the confounders, `X` contains standardized income, and the simulated treatment depends on `W` through a sparse signal plus noise.
+
+### Part 2
+
+**Question:** Simulate `Y_sim` so that the treatment effect varies nonlinearly with income.
+
+**Answer:** I simulated `Y_sim` using `T_sim`, `W`, and `X`, with a nonlinear true elasticity given by `-2.5 * tanh(2X)`.
+
+This makes the true elasticity nonlinear in income.
+
+```{python}
+p = W.shape[1]
+support = np.zeros(p)
+active_idx = np.random.choice(p, size=max(2, int(np.ceil(0.35 * p))), replace=False)
+support[active_idx] = 1
+
+coefs_T = np.random.normal(0, 0.35, p) * support
+coefs_Y = np.random.normal(0, 0.50, p) * support
+
+T_sim = 0.8 + W @ coefs_T + np.random.normal(0, 1.0, size=len(df))
+true_tau = -2.5 * np.tanh(2.0 * X[:, 0])
+Y_sim = true_tau * T_sim + W @ coefs_Y + np.random.normal(0, 1.0, size=len(df))
+```
+
+**Interpretation:**  
+The simulated outcome is appropriate for checking whether the models can recover nonlinear heterogeneity in price elasticity.
+
+### Part 3
+
+**Question:** Fit `CausalForestDML` and `LinearDML` to the simulated data, plot the estimated elasticities, compare them to the truth, and report the ATEs.
+
+**Answer:** I fit both models below and then compared their estimated elasticities to the true simulated relationship.
+
+I used `HistGradientBoostingRegressor` for the nuisance models because it is flexible and fast.
+
+```{python}
+nuisance_y = HistGradientBoostingRegressor(
+    max_depth=4, max_iter=300, learning_rate=0.05, random_state=2026
+)
+nuisance_t = HistGradientBoostingRegressor(
+    max_depth=4, max_iter=300, learning_rate=0.05, random_state=2026
+)
+
+cf_sim = CausalForestDML(
+    model_y=nuisance_y,
+    model_t=nuisance_t,
+    n_estimators=300,
+    min_samples_leaf=40,
+    max_depth=12,
+    max_samples=0.5,
+    discrete_treatment=False,
+    random_state=2026,
+)
+cf_sim.fit(Y_sim, T_sim, X=X, W=W, cache_values=True)
+
+lin_sim = LinearDML(
+    model_y=nuisance_y,
+    model_t=nuisance_t,
+    random_state=2026,
+)
+_ = lin_sim.fit(Y_sim, T_sim, X=X, W=W, cache_values=True)
+```
+
+#### Elasticity Curves
+
+```{python}
+grid_income = np.linspace(income_raw.min(), income_raw.max(), 200)
+grid_X = income_scaler.transform(pd.DataFrame({"INCOME": grid_income}))
+true_tau_grid = -2.5 * np.tanh(2.0 * grid_X[:, 0])
+
+cf_tau_grid = cf_sim.const_marginal_effect(grid_X).ravel()
+cf_lb_grid, cf_ub_grid = cf_sim.const_marginal_effect_interval(grid_X)
+cf_lb_grid = cf_lb_grid.ravel()
+cf_ub_grid = cf_ub_grid.ravel()
+
+lin_tau_grid = lin_sim.const_marginal_effect(grid_X).ravel()
+lin_lb_grid, lin_ub_grid = lin_sim.const_marginal_effect_interval(grid_X)
+lin_lb_grid = lin_lb_grid.ravel()
+lin_ub_grid = lin_ub_grid.ravel()
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+
+axes[0].plot(grid_income, true_tau_grid, color="black", linewidth=2, label="True elasticity")
+axes[0].plot(grid_income, cf_tau_grid, color="#1b9e77", linewidth=2, label="CausalForestDML")
+axes[0].fill_between(grid_income, cf_lb_grid, cf_ub_grid, color="#1b9e77", alpha=0.2, label="95% CI")
+axes[0].set_title("Simulated Elasticity vs Income: CausalForestDML")
+axes[0].set_xlabel("INCOME (log median income)")
+axes[0].set_ylabel("Elasticity")
+axes[0].legend()
+
+axes[1].plot(grid_income, true_tau_grid, color="black", linewidth=2, label="True elasticity")
+axes[1].plot(grid_income, lin_tau_grid, color="#d95f02", linewidth=2, label="LinearDML")
+axes[1].fill_between(grid_income, lin_lb_grid, lin_ub_grid, color="#d95f02", alpha=0.2, label="95% CI")
+axes[1].set_title("Simulated Elasticity vs Income: LinearDML")
+axes[1].set_xlabel("INCOME (log median income)")
+axes[1].legend()
+
+plt.tight_layout()
+plt.show()
+```
+
+#### Observation-Level Recovery
+
+```{python}
+cf_tau_hat_sim = cf_sim.const_marginal_effect(X).ravel()
+lin_tau_hat_sim = lin_sim.const_marginal_effect(X).ravel()
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharex=True, sharey=True)
+
+axes[0].scatter(true_tau, cf_tau_hat_sim, alpha=0.25, s=12, color="#1b9e77")
+axes[0].plot(
+    [true_tau.min(), true_tau.max()],
+    [true_tau.min(), true_tau.max()],
+    color="black",
+    linestyle="--",
+)
+axes[0].set_title("CausalForestDML: Predicted vs True Elasticity")
+axes[0].set_xlabel("True elasticity")
+axes[0].set_ylabel("Predicted elasticity")
+
+axes[1].scatter(true_tau, lin_tau_hat_sim, alpha=0.25, s=12, color="#d95f02")
+axes[1].plot(
+    [true_tau.min(), true_tau.max()],
+    [true_tau.min(), true_tau.max()],
+    color="black",
+    linestyle="--",
+)
+axes[1].set_title("LinearDML: Predicted vs True Elasticity")
+axes[1].set_xlabel("True elasticity")
+
+plt.tight_layout()
+plt.show()
+```
+
+#### ATE Results
+
+```{python}
+sim_results = pd.DataFrame({
+    "Model": ["Truth", "CausalForestDML", "LinearDML"],
+    "ATE": [
+        true_tau.mean(),
+        cf_sim.const_marginal_ate(X),
+        lin_sim.const_marginal_ate(X),
+    ],
+    "CI Lower": [
+        np.nan,
+        cf_sim.const_marginal_ate_interval(X)[0],
+        lin_sim.const_marginal_ate_interval(X)[0],
+    ],
+    "CI Upper": [
+        np.nan,
+        cf_sim.const_marginal_ate_interval(X)[1],
+        lin_sim.const_marginal_ate_interval(X)[1],
+    ],
+    "Corr with Truth": [
+        1.0,
+        np.corrcoef(true_tau, cf_tau_hat_sim)[0, 1],
+        np.corrcoef(true_tau, lin_tau_hat_sim)[0, 1],
+    ],
+    "RMSE vs Truth": [
+        0.0,
+        np.sqrt(np.mean((true_tau - cf_tau_hat_sim) ** 2)),
+        np.sqrt(np.mean((true_tau - lin_tau_hat_sim) ** 2)),
+    ],
+})
+
+show_df(sim_results)
+```
+
+**Interpretation:**  
+Both models recover the average effect well, but the causal forest tracks the nonlinear relationship much better. The linear DML model gets the average effect right, but it is too restrictive to match the curved pattern as closely.
+
+## Problem 2: Checking for Overlap
+
+**Question:** Use `LassoCV` to predict `T` from `W`, report \(R^2\), and decide whether the dataset has enough overlap for causal inference.
+
+**Answer:** I fit `LassoCV` below and used its \(R^2\) to measure how much treatment variation is explained by the confounders.
+
+```{python}
+lasso_t = LassoCV(cv=5, random_state=2026, max_iter=20000)
+lasso_t.fit(W, T)
+lasso_r2 = r2_score(T, lasso_t.predict(W))
+
+show_df(pd.DataFrame({
+    "Metric": ["LassoCV R^2 for predicting log(price) from W", "Residual variation share (1 - R^2)"],
+    "Value": [lasso_r2, 1 - lasso_r2],
+}))
+```
+
+**Interpretation:**  
+The \(R^2\) is about `0.574`, so the confounders explain part of the price variation but not all of it. Since about `42.6%` of the variation remains unexplained, the data still have enough residual treatment variation to make causal inference reasonable.
+
+## Problem 3: Fitting and Interpreting the Model
+
+### Part 1
+
+**Question:** Fit `CausalForestDML` on a training set, plot elasticity versus income with confidence intervals, and report the ATE.
+
+**Answer:** I split the data into training and testing sets, fit `CausalForestDML` on the training set, and then estimated elasticity as a function of income.
+
+```{python}
+idx = np.arange(len(df))
+train_idx, test_idx = train_test_split(idx, test_size=0.3, random_state=2026)
+
+W_train, W_test = W[train_idx], W[test_idx]
+X_train, X_test = X[train_idx], X[test_idx]
+T_train, T_test = T[train_idx], T[test_idx]
+Y_train, Y_test = Y[train_idx], Y[test_idx]
+
+income_train_raw = income_raw[train_idx]
+```
+
+```{python}
+cf_model = CausalForestDML(
+    model_y=nuisance_y,
+    model_t=nuisance_t,
+    n_estimators=300,
+    min_samples_leaf=40,
+    max_depth=12,
+    max_samples=0.5,
+    discrete_treatment=False,
+    random_state=2026,
+)
+cf_model.fit(Y_train, T_train, X=X_train, W=W_train, cache_values=True)
+
+lin_model = LinearDML(
+    model_y=nuisance_y,
+    model_t=nuisance_t,
+    random_state=2026,
+)
+_ = lin_model.fit(Y_train, T_train, X=X_train, W=W_train, cache_values=True)
+```
+
+#### Elasticity vs Income
+
+```{python}
+grid_income_train = np.linspace(income_train_raw.min(), income_train_raw.max(), 200)
+grid_X_train = income_scaler.transform(pd.DataFrame({"INCOME": grid_income_train}))
+
+cf_tau_train = cf_model.const_marginal_effect(grid_X_train).ravel()
+cf_lb_train, cf_ub_train = cf_model.const_marginal_effect_interval(grid_X_train)
+cf_lb_train = cf_lb_train.ravel()
+cf_ub_train = cf_ub_train.ravel()
+
+plt.figure(figsize=(8, 5))
+plt.plot(grid_income_train, cf_tau_train, color="#1b9e77", linewidth=2)
+plt.fill_between(grid_income_train, cf_lb_train, cf_ub_train, color="#1b9e77", alpha=0.2)
+plt.axhline(0, color="black", linestyle="--", linewidth=1)
+plt.xlabel("INCOME (log median income)")
+plt.ylabel("Estimated elasticity")
+plt.title("Problem 3: CausalForestDML Elasticity vs Income")
+plt.show()
+```
+
+#### Average Treatment Effect
+
+```{python}
+real_ate_results = pd.DataFrame({
+    "Model": ["CausalForestDML", "LinearDML"],
+    "ATE": [
+        cf_model.const_marginal_ate(X_train),
+        lin_model.const_marginal_ate(X_train),
+    ],
+    "CI Lower": [
+        cf_model.const_marginal_ate_interval(X_train)[0],
+        lin_model.const_marginal_ate_interval(X_train)[0],
+    ],
+    "CI Upper": [
+        cf_model.const_marginal_ate_interval(X_train)[1],
+        lin_model.const_marginal_ate_interval(X_train)[1],
+    ],
+})
+
+show_df(real_ate_results)
+```
+
+**Interpretation:**  
+The estimated ATE is about `-2.65`, with a confidence interval well below zero. In the log-log model, this means a 1% increase in price is associated with about a 2.65% decrease in sales on average.
+
+### Part 2
+
+**Question:** Compute the R-score on the test set, fit `LinearDML` in the same way, and compare the two models.
+
+**Answer:** I used the holdout set to compute the R-score for both models.
+
+#### R-Score Comparison
+
+```{python}
+r_scorer = RScorer(
+    model_y=nuisance_y,
+    model_t=nuisance_t,
+    random_state=2026,
+)
+r_scorer.fit(Y_test, T_test, X=X_test, W=W_test)
+
+rscore_cf = r_scorer.score(cf_model)
+rscore_lin = r_scorer.score(lin_model)
+
+show_df(pd.DataFrame({
+    "Model": ["CausalForestDML", "LinearDML"],
+    "R-score": [rscore_cf, rscore_lin],
+}))
+```
+
+**Interpretation:**  
+The causal forest has a slightly positive R-score (`~0.004`), while the linear model is slightly negative (`~-0.001`). This suggests the forest is a little better, but the evidence for strong heterogeneity in the real data is weak.
+
+### Part 3
+
+**Question:** Run a sensitivity check with `c_t = 0.1` and `c_y = 0.3` and report whether the interval contains 0.
+
+**Answer:** I used `sensitivity_interval` for the most extreme scenario requested in the lab.
+
+```{python}
+sens_lb, sens_ub = cf_model.sensitivity_interval(c_t=0.1, c_y=0.3)
+
+show_df(pd.DataFrame({
+    "Scenario": ["Sensitivity interval with c_t=0.1, c_y=0.3"],
+    "CI Lower": [sens_lb],
+    "CI Upper": [sens_ub],
+    "Contains 0?": [sens_lb <= 0 <= sens_ub],
+}))
+```
+
+**Interpretation:**  
+Even under this stronger hidden-confounding scenario, the interval stays below 0. Since it does not contain 0, the conclusion that price elasticity is negative remains fairly robust.
+
+## Problem 4: CATE for Brands and Income
+
+**Question:** Move brand from `W` to `X`, refit the model, report modifier importance, and plot elasticity versus income for each brand.
+
+**Answer:** For this part, I moved `brand` out of `W` and into `X`, so the modifiers are:
+
+- standardized income
+- brand indicators
+
+Then I refit the causal forest and inspected the modifier importances.
+
+```{python}
+w_preprocessor_p4 = ColumnTransformer(
+    transformers=[
+        ("num", StandardScaler(), w_num_cols),
+    ],
+    remainder="drop",
+)
+W_p4 = w_preprocessor_p4.fit_transform(df)
+
+brand_encoder = OneHotEncoder(drop=None, sparse_output=False)
+brand_matrix = brand_encoder.fit_transform(df[["brand"]])
+brand_levels = list(brand_encoder.categories_[0])
+brand_feature_names = [f"brand_{b}" for b in brand_levels]
+
+income_z = income_scaler.transform(df[["INCOME"]])
+X_p4 = np.column_stack([income_z, brand_matrix])
+X_p4_names = ["income_z"] + brand_feature_names
+
+W_p4_train = W_p4[train_idx]
+X_p4_train = X_p4[train_idx]
+```
+
+```{python}
+cf_brand = CausalForestDML(
+    model_y=nuisance_y,
+    model_t=nuisance_t,
+    n_estimators=300,
+    min_samples_leaf=40,
+    max_depth=12,
+    max_samples=0.5,
+    discrete_treatment=False,
+    random_state=2026,
+)
+cf_brand.fit(Y_train, T_train, X=X_p4_train, W=W_p4_train, cache_values=True)
+
+feature_importance_df = pd.DataFrame({
+    "Modifier": X_p4_names,
+    "Importance": cf_brand.feature_importances_,
+}).sort_values("Importance", ascending=False)
+
+show_df(feature_importance_df)
+```
+
+```{python}
+plt.figure(figsize=(8, 5))
+sns.barplot(data=feature_importance_df, x="Importance", y="Modifier", color="#4c78a8")
+plt.title("Problem 4: Modifier Importances")
+plt.xlabel("Importance")
+plt.ylabel("")
+plt.show()
+```
+
+### Brand-Specific Elasticity Curves
+
+```{python}
+income_grid_p4 = np.linspace(income_train_raw.min(), income_train_raw.max(), 200)
+income_grid_z = income_scaler.transform(pd.DataFrame({"INCOME": income_grid_p4}))[:, 0]
+
+brand_curve_rows = []
+for brand_i, brand_name in enumerate(brand_levels):
+    X_grid_brand = np.column_stack([
+        income_grid_z,
+        np.zeros((len(income_grid_p4), len(brand_levels)))
+    ])
+    X_grid_brand[:, 1 + brand_i] = 1
+
+    tau_hat = cf_brand.const_marginal_effect(X_grid_brand).ravel()
+    tau_lb, tau_ub = cf_brand.const_marginal_effect_interval(X_grid_brand)
+
+    brand_curve_rows.append(pd.DataFrame({
+        "INCOME": income_grid_p4,
+        "Elasticity": tau_hat,
+        "Lower": tau_lb.ravel(),
+        "Upper": tau_ub.ravel(),
+        "Brand": brand_name,
+    }))
+
+brand_curve_df = pd.concat(brand_curve_rows, ignore_index=True)
+```
+
+```{python}
+plt.figure(figsize=(9, 6))
+
+palette = {
+    "dominicks": "#1b9e77",
+    "minute.maid": "#d95f02",
+    "tropicana": "#7570b3",
+}
+
+for brand_name in brand_levels:
+    temp = brand_curve_df[brand_curve_df["Brand"] == brand_name]
+    plt.plot(temp["INCOME"], temp["Elasticity"], linewidth=2, label=brand_name, color=palette[brand_name])
+
+plt.axhline(0, color="black", linestyle="--", linewidth=1)
+plt.xlabel("INCOME (log median income)")
+plt.ylabel("Estimated elasticity")
+plt.title("Problem 4: Elasticity vs Income by Brand")
+plt.legend(title="Brand")
+plt.show()
+```
+
+To summarize the pattern, I compared average predicted elasticity within each brand-specific curve.
+
+```{python}
+brand_summary = (
+    brand_curve_df.groupby("Brand", as_index=False)["Elasticity"]
+    .agg(["mean", "min", "max"])
+    .reset_index()
+)
+show_df(brand_summary)
+```
+
+**Interpretation:**  
+Income is still the most important modifier, but brand also matters. `dominicks` is generally the most price-sensitive brand. `minute.maid` is less price-sensitive than `dominicks`, and `tropicana` is typically the least price-sensitive at higher income levels. The separation is not huge, but the curves do suggest meaningful brand differences layered on top of the income effect.
+
+## Conclusion
+
+The simulated exercise shows that the causal forest can recover nonlinear heterogeneity better than the linear model. In the real data, the average price elasticity is clearly negative, while the evidence for strong heterogeneity is modest. When brand is added to the modifier set, income remains the main driver of heterogeneity, with additional differences across brands.
