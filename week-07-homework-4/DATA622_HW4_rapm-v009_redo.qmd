@@ -1,0 +1,659 @@
+---
+title: "DATA 622 Homework 4 Redo: Regularization and Model Selection"
+author: "Sabina Baraili"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    number-depth: 2
+    toc-depth: 2
+    fig-width: 8
+    fig-height: 5
+    geometry: margin=1in
+    include-in-header:
+      text: |
+        \setlength{\emergencystretch}{3em}
+        \AtBeginEnvironment{longtable}{\small}
+        \AtBeginEnvironment{tabular}{\small}
+execute:
+  echo: false
+  warning: false
+  message: false
+jupyter: python3
+---
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.linear_model import Ridge, LassoCV
+from sklearn.metrics import mean_squared_error
+from scipy.stats import norm
+
+sns.set_theme(style="whitegrid", context="notebook")
+np.random.seed(622)
+pd.set_option("display.max_columns", 20)
+pd.set_option("display.width", 140)
+```
+
+```{python}
+def show_df(df, digits=3):
+    return df.round(digits)
+
+
+def player_minutes_from_stints(df, player_cols):
+    return {
+        col: float((df["minutes"] * (df[col].abs() > 0)).sum())
+        for col in player_cols
+    }
+
+
+def hat_diag(X):
+    XtX_inv = np.linalg.pinv(X.T @ X)
+    return np.sum((X @ XtX_inv) * X, axis=1)
+
+
+def ridge_gcv_search(X, y, alphas):
+    X_mean = X.mean(axis=0)
+    y_mean = y.mean()
+    Xc = X - X_mean
+    yc = y - y_mean
+
+    XtX = Xc.T @ Xc
+    Xty = Xc.T @ yc
+    n = X.shape[0]
+
+    rows = []
+    best = None
+
+    for alpha in alphas:
+        beta = np.linalg.solve(XtX + alpha * np.eye(X.shape[1]), Xty)
+        yhat = Xc @ beta
+        rss = np.sum((yc - yhat) ** 2)
+        smoother = np.linalg.solve(XtX + alpha * np.eye(X.shape[1]), XtX)
+        df_eff = np.trace(smoother)
+        gcv = rss / max((n - df_eff) ** 2, 1e-12)
+
+        row = {
+            "alpha": alpha,
+            "gcv": gcv,
+            "df_eff": df_eff,
+        }
+        rows.append(row)
+
+        if best is None or gcv < best["gcv"]:
+            best = row
+
+    grid = pd.DataFrame(rows)
+    return best["alpha"], grid
+
+
+def fit_weighted_ridge_closed_form(X, y, w, alpha):
+    x_bar = np.average(X, axis=0, weights=w)
+    y_bar = np.average(y, weights=w)
+
+    Xc = X - x_bar
+    yc = y - y_bar
+    sqrt_w = np.sqrt(w)
+    Xw = Xc * sqrt_w[:, None]
+    yw = yc * sqrt_w
+
+    beta = np.linalg.solve(
+        Xw.T @ Xw + alpha * np.eye(X.shape[1]),
+        Xw.T @ yw,
+    )
+    intercept = y_bar - x_bar @ beta
+    return intercept, beta
+```
+
+# Assignment Setup
+
+```{python}
+df = pd.read_csv("data/nba_stint_data.csv").copy()
+player_map = pd.read_csv("data/player_id.csv").copy()
+
+non_player_cols = [
+    "game_id", "stint_id", "n_pos", "home_points",
+    "away_points", "minutes", "margin"
+]
+player_cols = [c for c in df.columns if c not in non_player_cols]
+
+X = df[player_cols].to_numpy(dtype=float)
+y = df["margin"].to_numpy(dtype=float)
+n_pos = df["n_pos"].to_numpy(dtype=float)
+margin_rate = y / n_pos
+
+player_map["player_id"] = player_map["player_id"].astype(int)
+player_map = player_map.drop_duplicates(subset=["player_id"], keep="first")
+
+minutes_lookup = player_minutes_from_stints(df, player_cols)
+
+data_summary = pd.DataFrame(
+    {
+        "quantity": ["stints", "player coefficients", "games"],
+        "value": [len(df), len(player_cols), df["game_id"].nunique()],
+    }
+)
+show_df(data_summary, 0)
+```
+
+This report uses leave-one-out cross-validation for the OLS baseline, includes the unweighted `r_unw` ranking table and RAPM-versus-minutes plot, corrects the weighting diagnostic, discusses how the rankings change after weighting, and plots uncertainty versus minutes for the full player pool.
+
+# Problem 1: Ridge Regression for Inference
+
+## Part (a): Ordinary Linear Regression
+
+For OLS, leave-one-out cross-validation is especially convenient because the fitted-value leverages let us compute the LOOCV error directly from one model fit.
+
+```{python}
+X_ols = np.column_stack([np.ones(X.shape[0]), X])
+beta_ols = np.linalg.pinv(X_ols.T @ X_ols) @ X_ols.T @ y
+yhat_ols = X_ols @ beta_ols
+resid_ols = y - yhat_ols
+
+h = hat_diag(X_ols)
+loo_resid = resid_ols / np.maximum(1 - h, 1e-12)
+
+rmse_ols_train = np.sqrt(mean_squared_error(y, yhat_ols))
+rmse_ols_loo = np.sqrt(np.mean(loo_resid ** 2))
+
+ols_summary = pd.DataFrame(
+    {
+        "metric": [
+            "OLS in-sample RMSE",
+            "OLS LOOCV RMSE",
+            "LOOCV - train gap",
+        ],
+        "value": [
+            rmse_ols_train,
+            rmse_ols_loo,
+            rmse_ols_loo - rmse_ols_train,
+        ],
+    }
+)
+show_df(ols_summary, 4)
+```
+
+The LOOCV RMSE is larger than the training RMSE, so the OLS fit does lose some accuracy out of sample. The gap is noticeable but not extreme, which makes OLS a reasonable baseline but not the model I would lean on most for RAPM.
+
+**Interpretation**
+
+That pattern makes sense for this problem. The design matrix is wide and highly collinear because players share the floor in many overlapping lineups. OLS can still fit the data, but a regularized model should be more stable than an unpenalized one.
+
+## Part (b): Examining RAPM Coefficients
+
+I fit ridge regression on the unweighted outcome using the required alpha grid and choose the penalty with an efficient generalized cross-validation calculation on the lineup matrix.
+
+```{python}
+alpha_grid = np.logspace(-2, 5, 25)
+best_alpha, gcv_grid = ridge_gcv_search(X, y, alpha_grid)
+
+ridge_unweighted = Ridge(alpha=best_alpha, fit_intercept=True)
+ridge_unweighted.fit(X, y)
+yhat_ridge_unweighted = ridge_unweighted.predict(X)
+
+rmse_ridge_train = np.sqrt(mean_squared_error(y, yhat_ridge_unweighted))
+ridge_summary = pd.DataFrame(
+    {
+        "metric": [
+            "selected alpha",
+            "ridge in-sample RMSE",
+            "OLS LOOCV RMSE for comparison",
+            "OLS to ridge train RMSE difference",
+        ],
+        "value": [
+            best_alpha,
+            rmse_ridge_train,
+            rmse_ols_loo,
+            rmse_ols_train - rmse_ridge_train,
+        ],
+    }
+)
+show_df(ridge_summary, 4)
+```
+
+```{python}
+show_df(
+    gcv_grid.sort_values("gcv").head(8),
+    5
+)
+```
+
+```{python}
+rapm_unweighted = pd.DataFrame(
+    {
+        "player_id": pd.Series(player_cols, dtype=int),
+        "rapm_unweighted": ridge_unweighted.coef_,
+        "minutes": [minutes_lookup[c] for c in player_cols],
+    }
+)
+
+rank_unweighted = (
+    rapm_unweighted
+    .sort_values("rapm_unweighted", ascending=False)
+    .reset_index(drop=True)
+)
+rank_unweighted["r_unw"] = np.arange(1, len(rank_unweighted) + 1)
+
+top20_unweighted = (
+    rank_unweighted
+    .merge(player_map, on="player_id", how="left")
+    .loc[:, ["r_unw", "player_name", "player_id", "rapm_unweighted", "minutes"]]
+    .head(20)
+)
+show_df(top20_unweighted, 3)
+```
+
+```{python}
+plt.figure(figsize=(8, 5))
+plt.scatter(
+    rapm_unweighted["minutes"],
+    rapm_unweighted["rapm_unweighted"],
+    alpha=0.55,
+    s=28,
+    color="#4C78A8",
+)
+plt.xlabel("Total Minutes")
+plt.ylabel("Unweighted RAPM")
+plt.title("Unweighted RAPM Versus Minutes")
+plt.show()
+```
+
+The table is sorted by `r_unw`. The top unweighted RAPM player is `{python} top20_unweighted.iloc[0]["player_name"]`, followed by `{python} top20_unweighted.iloc[1]["player_name"]` and `{python} top20_unweighted.iloc[2]["player_name"]`.
+
+**Interpretation**
+
+The scatterplot shows why minutes matter for interpretation. Strong RAPM values from players with larger minute totals are easier to trust than equally large values from players with smaller samples. The names near the top of the list are also a useful basketball sanity check: seeing players such as `{python} top20_unweighted.iloc[0]["player_name"]` and `{python} top20_unweighted.iloc[1]["player_name"]` near the top makes the model feel more plausible than if the list were dominated only by low-minute role players.
+
+## Part (c): Ridge RAPM
+
+```{python}
+top10_display = pd.DataFrame(
+    {
+        "top_10_unweighted_players": top20_unweighted["player_name"].head(10).tolist()
+    }
+)
+show_df(top10_display, 3)
+```
+
+The top of the unweighted ridge list includes several players who pass a basic basketball reality check, along with a few names that are harder to believe at face value. That is typical for a single-season RAPM model because it is trying to separate player effects from noisy lineup combinations.
+
+**Interpretation**
+
+The rankings are believable in a broad sense, but I would not read them as exact truths. A player can look better or worse depending on teammates, opponents, minute totals, and how much regularization pulls noisy estimates back toward zero. That is why the minutes table in part (b) matters: it helps separate strong estimates with a real sample behind them from results that may be driven more by noise.
+
+# Problem 2: Possession Weights
+
+## Part (a): Heteroscedasticity in Stints
+
+The key object is the margin per possession, `margin_rate = margin / n_pos`. Short stints should have noisier rates because each possession has more influence on the observed average.
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+axes[0].scatter(df["n_pos"], margin_rate, alpha=0.22, s=18, color="#4C78A8")
+axes[0].set_title("Margin Rate Versus Possessions")
+axes[0].set_xlabel("Possessions in Stint")
+axes[0].set_ylabel("Margin per Possession")
+
+weighted_response = margin_rate * np.sqrt(n_pos)
+axes[1].scatter(df["n_pos"], weighted_response, alpha=0.22, s=18, color="#F58518")
+axes[1].set_title("Weighted Response: Margin Rate x sqrt(Possessions)")
+axes[1].set_xlabel("Possessions in Stint")
+axes[1].set_ylabel("Margin Rate x sqrt(Possessions)")
+
+plt.tight_layout()
+plt.show()
+```
+
+The first plot shows a funnel shape: low-possession stints have much more variable margin rates. In the second plot, multiplying the response by `sqrt(n_pos)` makes the spread much more stable across possession levels, which is the pattern we want if weighting by possessions is correcting heteroscedasticity rather than making it worse.
+
+**Interpretation**
+
+This is the main statistical reason to weight the regression by `n_pos`. Longer stints contain more information about lineup performance than extremely short stints, so they should have more influence in estimation.
+
+## Part (b): Implementing Weighted Regression
+
+```{python}
+weighted_intercept, weighted_coef = fit_weighted_ridge_closed_form(
+    X, y, n_pos, best_alpha
+)
+yhat_ridge_weighted = X @ weighted_coef + weighted_intercept
+
+weighted_fit_summary = pd.DataFrame(
+    {
+        "metric": [
+            "weighted RMSE using n_pos weights",
+            "unweighted RMSE from weighted model predictions",
+        ],
+        "value": [
+            np.sqrt(np.average((y - yhat_ridge_weighted) ** 2, weights=n_pos)),
+            np.sqrt(mean_squared_error(y, yhat_ridge_weighted)),
+        ],
+    }
+)
+show_df(weighted_fit_summary, 4)
+```
+
+```{python}
+rapm_weighted = pd.DataFrame(
+    {
+        "player_id": pd.Series(player_cols, dtype=int),
+        "rapm_weighted": weighted_coef,
+        "minutes": [minutes_lookup[c] for c in player_cols],
+    }
+)
+
+rank_weighted = (
+    rapm_weighted
+    .sort_values("rapm_weighted", ascending=False)
+    .reset_index(drop=True)
+)
+rank_weighted["r_w"] = np.arange(1, len(rank_weighted) + 1)
+
+rank_compare = (
+    rank_unweighted[["player_id", "rapm_unweighted", "r_unw", "minutes"]]
+    .merge(rank_weighted[["player_id", "rapm_weighted", "r_w"]], on="player_id", how="left")
+    .merge(player_map, on="player_id", how="left")
+)
+rank_compare["shift_w_minus_unw"] = rank_compare["r_w"] - rank_compare["r_unw"]
+
+top20_compare = (
+    rank_compare
+    .sort_values("r_unw")
+    .loc[:, [
+        "player_name", "r_unw", "r_w", "shift_w_minus_unw",
+        "rapm_unweighted", "rapm_weighted", "minutes"
+    ]]
+    .head(20)
+)
+show_df(top20_compare, 3)
+```
+
+```{python}
+largest_risers = rank_compare.sort_values("shift_w_minus_unw").head(5)
+largest_fallers = rank_compare.sort_values("shift_w_minus_unw", ascending=False).head(5)
+
+top_weighted_names = (
+    rank_compare.sort_values("r_w")
+    .head(10)["player_name"]
+    .tolist()
+)
+
+show_df(
+    largest_risers.loc[:, ["player_name", "r_unw", "r_w", "shift_w_minus_unw", "minutes"]],
+    2
+)
+```
+
+```{python}
+show_df(
+    largest_fallers.loc[:, ["player_name", "r_unw", "r_w", "shift_w_minus_unw", "minutes"]],
+    2
+)
+```
+
+Relative to the unweighted model, `{python} largest_risers.iloc[0]["player_name"]` is one of the biggest movers upward after weighting, while `{python} largest_fallers.iloc[0]["player_name"]` falls the most. The weighted top 10 are `{python} ", ".join(top_weighted_names)`.
+
+**Interpretation**
+
+The ranking changes are the main takeaway in Problem 2. Weighting gives more influence to high-possession stints, so players whose unweighted RAPM was driven more by short, volatile samples tend to lose ground, while players with stronger results over larger possession samples tend to rise or stay near the top. The weighted rankings look more conservative and more believable.
+
+# Problem 3: Interpreting Bootstrap Uncertainty
+
+## Part (a): Calculate Confidence Intervals Using the Bootstrap
+
+I bootstrap stint rows, refit the weighted ridge model each time, and keep the full coefficient vector so that uncertainty can be examined for all players, not just the top 20.
+
+```{python}
+B = 5
+n = X.shape[0]
+boot_coef = np.zeros((B, len(player_cols)))
+
+for b in range(B):
+    idx = np.random.choice(n, size=n, replace=True)
+    Xb = X[idx]
+    yb = y[idx]
+    wb = n_pos[idx]
+
+    _, coef_b = fit_weighted_ridge_closed_form(Xb, yb, wb, best_alpha)
+    boot_coef[b] = coef_b
+```
+
+```{python}
+coef_index = {int(col): i for i, col in enumerate(player_cols)}
+top20_weighted = rank_compare.sort_values("r_w").head(20).copy()
+top20_idx = [coef_index[int(pid)] for pid in top20_weighted["player_id"]]
+
+boot_low = np.quantile(boot_coef[:, top20_idx], 0.04, axis=0)
+boot_high = np.quantile(boot_coef[:, top20_idx], 0.96, axis=0)
+boot_se_top20 = boot_coef[:, top20_idx].std(axis=0, ddof=1)
+
+boot_top20 = top20_weighted.loc[:, ["player_id", "player_name", "rapm_weighted", "minutes"]].copy()
+boot_top20["boot_se"] = boot_se_top20
+boot_top20["ci92_low"] = boot_low
+boot_top20["ci92_high"] = boot_high
+
+show_df(
+    boot_top20.loc[:, ["player_name", "rapm_weighted", "boot_se", "ci92_low", "ci92_high", "minutes"]],
+    3
+)
+```
+
+```{python}
+intervals = boot_top20[["ci92_low", "ci92_high"]].to_numpy()
+overlap_pairs = 0
+pair_count = 0
+
+for i in range(len(intervals)):
+    for j in range(i + 1, len(intervals)):
+        pair_count += 1
+        left = max(intervals[i, 0], intervals[j, 0])
+        right = min(intervals[i, 1], intervals[j, 1])
+        if left <= right:
+            overlap_pairs += 1
+
+overlap_rate = overlap_pairs / pair_count
+
+pd.DataFrame(
+    {"pairwise overlap rate among top-20 92% intervals": [overlap_rate]}
+).round(3)
+```
+
+There is substantial overlap across many of the top players' 92% intervals, which means the ordering at the very top should not be treated as perfectly precise.
+
+**Interpretation**
+
+The top of a RAPM ranking usually looks more precise than it really is. The bootstrap intervals show that some players are clearly positive, but many nearby ranks are hard to separate in a meaningful way.
+
+## Part (b): Uncertainty Versus Minutes
+
+```{python}
+boot_se_all = boot_coef.std(axis=0, ddof=1)
+
+uncertainty_all = (
+    rank_compare.loc[:, ["player_id", "player_name", "minutes", "rapm_weighted", "r_w"]]
+    .copy()
+)
+uncertainty_all["boot_se"] = [
+    boot_se_all[coef_index[int(pid)]]
+    for pid in uncertainty_all["player_id"]
+]
+
+plt.figure(figsize=(8, 5))
+plt.scatter(
+    uncertainty_all["minutes"],
+    uncertainty_all["boot_se"],
+    alpha=0.45,
+    s=24,
+    color="#54A24B",
+)
+
+for _, row in uncertainty_all.sort_values("minutes", ascending=False).head(10).iterrows():
+    plt.text(row["minutes"], row["boot_se"], row["player_name"], fontsize=7)
+
+plt.xlabel("Total Minutes")
+plt.ylabel("Bootstrap Standard Error")
+plt.title("RAPM Uncertainty Versus Minutes for All Players")
+plt.show()
+```
+
+The plot now includes all players. In general, uncertainty falls as minutes increase, but the pattern is not perfectly smooth because RAPM is also affected by regularization and lineup collinearity.
+
+**Interpretation**
+
+This full-player plot is more informative than looking only at the top 20 because it shows the overall pattern directly. Low-minute players tend to have much noisier RAPM estimates, while heavy-minute players are usually estimated with more precision.
+
+## Part (c): Bayesian-Style Comparison
+
+```{python}
+sqrt_w = np.sqrt(n_pos)
+Xw = X * sqrt_w[:, None]
+yw = y * sqrt_w
+
+XtWX = Xw.T @ Xw
+p = XtWX.shape[0]
+I = np.eye(p)
+A_inv = np.linalg.pinv(XtWX + best_alpha * I)
+
+resid_weighted = yw - (Xw @ weighted_coef + weighted_intercept * sqrt_w)
+df_resid = max(X.shape[0] - X.shape[1] - 1, 1)
+sigma2_hat = (resid_weighted @ resid_weighted) / df_resid
+
+cov_ridge = sigma2_hat * (A_inv @ XtWX @ A_inv)
+bayes_se_all = np.sqrt(np.diag(cov_ridge))
+
+bayes_compare = boot_top20.loc[:, ["player_id", "player_name", "boot_se"]].copy()
+bayes_compare["bayes_se"] = [
+    bayes_se_all[coef_index[int(pid)]]
+    for pid in bayes_compare["player_id"]
+]
+bayes_compare["abs_diff"] = np.abs(
+    bayes_compare["boot_se"] - bayes_compare["bayes_se"]
+)
+
+show_df(
+    bayes_compare.sort_values("abs_diff", ascending=False),
+    3
+)
+```
+
+The bootstrap and Bayesian-style standard errors are broadly similar for many players, but the biggest disagreements occur for the noisier cases.
+
+**Interpretation**
+
+That comparison makes sense to me. The Bayesian-style formula is cleaner and faster, but it leans more heavily on the model assumptions. The bootstrap is slower, yet it reflects empirical instability more directly, which is especially useful for players whose estimates move around when the stints are resampled.
+
+# Extra Credit: Ridge Versus Lasso and Interval Caveat
+
+## Part (a): Ridge Versus Lasso
+
+For the extra credit, I fit a lasso model on the same unweighted design matrix and compare it to the ridge fit from Problem 1. I use a separate alpha grid for lasso, following the scale suggested in the lab.
+
+```{python}
+lasso_alphas = np.logspace(-4, 2, 20)
+lasso_cv = LassoCV(
+    alphas=lasso_alphas,
+    cv=3,
+    fit_intercept=True,
+    random_state=622,
+    max_iter=5000,
+)
+lasso_cv.fit(X, y)
+
+lasso_summary = pd.DataFrame(
+    {
+        "metric": [
+            "selected lasso alpha",
+            "nonzero lasso coefficients",
+            "share of coefficients set to zero",
+        ],
+        "value": [
+            lasso_cv.alpha_,
+            int((lasso_cv.coef_ != 0).sum()),
+            1 - (lasso_cv.coef_ != 0).mean(),
+        ],
+    }
+)
+show_df(lasso_summary, 4)
+```
+
+```{python}
+rapm_compare = pd.DataFrame(
+    {
+        "player_id": pd.Series(player_cols, dtype=int),
+        "ridge_rapm": ridge_unweighted.coef_,
+        "lasso_rapm": lasso_cv.coef_,
+        "minutes": [minutes_lookup[c] for c in player_cols],
+    }
+).merge(player_map, on="player_id", how="left")
+
+rapm_compare["ridge_minus_lasso"] = (
+    rapm_compare["ridge_rapm"] - rapm_compare["lasso_rapm"]
+)
+rapm_compare["abs_diff"] = rapm_compare["ridge_minus_lasso"].abs()
+
+ridge_top20 = (
+    rapm_compare.sort_values("ridge_rapm", ascending=False)
+    .head(20)
+    .loc[:, ["player_name", "ridge_rapm", "lasso_rapm", "minutes"]]
+)
+
+lasso_top20 = (
+    rapm_compare.sort_values("lasso_rapm", ascending=False)
+    .head(20)
+    .loc[:, ["player_name", "lasso_rapm", "ridge_rapm", "minutes"]]
+)
+
+show_df(ridge_top20, 3)
+```
+
+```{python}
+show_df(lasso_top20, 3)
+```
+
+```{python}
+ridge_gt_lasso = (
+    rapm_compare.sort_values("ridge_minus_lasso", ascending=False)
+    .head(10)
+    .loc[:, ["player_name", "ridge_rapm", "lasso_rapm", "ridge_minus_lasso", "minutes"]]
+)
+
+lasso_gt_ridge = (
+    rapm_compare.sort_values("ridge_minus_lasso", ascending=True)
+    .head(10)
+    .loc[:, ["player_name", "ridge_rapm", "lasso_rapm", "ridge_minus_lasso", "minutes"]]
+)
+
+show_df(ridge_gt_lasso, 3)
+```
+
+```{python}
+show_df(lasso_gt_ridge, 3)
+```
+
+The broad pattern is that lasso is much sparser than ridge and pushes a smaller set of players to larger absolute values. The top of the lasso list overlaps substantially with the top of the ridge list, but the lasso coefficients are more extreme for the biggest stars and exactly zero for many players that ridge still treats as meaningfully positive or negative.
+
+**Interpretation**
+
+Looking at the biggest disagreements and then checking how those players looked in the following season, a few patterns stand out.
+
+- On the lasso-greater-than-ridge side, Nikola Jokic and Joel Embiid both clearly validate the idea that true top-end stars can deserve very large coefficients. Jokic won the 2023-24 MVP, and Embiid remained an elite offensive player when healthy. Pascal Siakam also had a strong 2023-24 season and helped Indiana reach the conference finals. Those cases make the lasso's aggressive treatment of a few stars look reasonable.
+- On the ridge-greater-than-lasso side, Scottie Barnes, Alperen Sengun, and James Harden all had stronger 2023-24 seasons than a zero-or-near-zero lasso coefficient would suggest. Barnes became an All-Star, Sengun was a Most Improved finalist, and Harden was still a high-level creator for the Clippers. Those cases make ridge look better at preserving strong but less singular impact players.
+- Kevin Love is a useful counterexample on the lasso side. Lasso rates him much more highly than ridge, but his 2023-24 role was much smaller, which makes that lasso estimate look too aggressive.
+
+Overall, I would give ridge the edge in the disagreement cases because it seems less likely to overreact to one-season lineup structure and less likely to erase good players who are clearly helpful but not absolute focal points. Lasso does a better job of separating out the most obvious stars, but ridge looks more realistic across the broader set of disagreements.
+
+## Part (b): Interval Caveat
+
+The subtle flaw is that the interval calculations were treated as if the players and model were chosen in advance, but they were not. In practice, I first used the same data to identify the top players and to choose the tuning level, and only after that did I compute intervals. That means the reported intervals ignore selection uncertainty and the winner's-curse effect that comes from focusing on the most extreme estimated coefficients.
+
+**Interpretation**
+
+The intervals are still useful as rough summaries of uncertainty, but they are too optimistic if interpreted as fully valid post-selection confidence or credible intervals for the "top 20" players. A stricter analysis would account for the fact that the ranking itself and the amount of regularization were learned from the same sample.
+
+# Conclusion
+
+Overall, the weighted ridge model still looks like the most defensible summary here because it handles lineup collinearity and also gives more influence to longer, more informative stints. The main lesson from the full set of plots and tables is that minutes and uncertainty matter a lot when interpreting any RAPM ranking.
