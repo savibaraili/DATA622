@@ -1,0 +1,446 @@
+---
+title: "Lab 2: The Linear Model"
+author: "Sabina Baraili"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+jupyter: python3
+---
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.formula.api import ols
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import warnings
+warnings.filterwarnings('ignore')
+
+df = pd.read_csv('earnings.csv')
+
+def subset_profile(data, label):
+    return pd.Series({
+        'subset': label,
+        'n': len(data),
+        'mean_age': data['age'].mean(),
+        'male_rate': data['male'].mean(),
+        'zero_earnings_rate': (data['earnk'] == 0).mean()
+    })
+```
+
+# Problem 1: Confounds in Earnings Data
+
+## Part A: Exploratory Data Analysis
+
+### Missing Values
+
+I start by removing rows with missing earnings or education values, then I check whether this complete-case filter materially changes the sample.
+
+```{python}
+df_clean = df.dropna(subset=['earnk', 'education']).copy()
+df_clean['log_earnk'] = np.log1p(df_clean['earnk'])
+
+missing_check = pd.DataFrame({
+    'full_sample_mean': df[['age', 'male', 'height', 'weight',
+                            'mother_education', 'father_education']].mean(),
+    'complete_case_mean': df_clean[['age', 'male', 'height', 'weight',
+                                    'mother_education', 'father_education']].mean()
+}).round(3)
+missing_check['difference'] = (
+    missing_check['complete_case_mean'] - missing_check['full_sample_mean']
+).round(3)
+```
+
+```{python}
+#| output: asis
+
+print(f"Rows in original data: {len(df)}")
+print(f"Rows after dropping missing earnk/education: {len(df_clean)}")
+print(f"Rows removed: {len(df) - len(df_clean)}")
+print("")
+print(missing_check.to_string())
+```
+
+### Log Transformation Decision
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].hist(df_clean['earnk'], bins=50, edgecolor='black')
+axes[0].set_title('Original Earnings')
+axes[0].set_xlabel('Earnings ($1000s)')
+
+axes[1].hist(df_clean['log_earnk'], bins=50, edgecolor='black')
+axes[1].set_title('Log-Transformed Earnings')
+axes[1].set_xlabel('Log(Earnings + 1)')
+
+plt.tight_layout()
+plt.show()
+```
+
+The original distribution is heavily right-skewed. The log transformation makes it much more symmetric, which works better for linear regression.
+
+About zero earnings: there are `{python} int((df_clean['earnk'] == 0).sum())` observations with `earnk = 0`, which is about `{python} f"{100 * (df_clean['earnk'] == 0).mean():.1f}"`% of the analysis sample. I do **not** discard them. Instead, I use `log(earnk + 1)` so that zero earners remain in the dataset. This is a practical modeling choice for this assignment, but it does compress differences near zero and is not the same as a full two-part or Heckman-style approach that separately models the probability of zero earnings.
+
+**Decision:** I'll use `log_earnk` as my target variable for the rest of this analysis.
+
+### Key Relationships
+
+```{python}
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+axes[0, 0].scatter(df_clean['age'], df_clean['log_earnk'], alpha=0.3, s=10)
+axes[0, 0].set_title('Age vs Log Earnings')
+
+axes[0, 1].scatter(df_clean['education'], df_clean['log_earnk'], alpha=0.3, s=10)
+axes[0, 1].set_title('Education vs Log Earnings')
+
+df_clean.boxplot(column='log_earnk', by='male', ax=axes[1, 0])
+axes[1, 0].set_title('Earnings by Gender')
+
+df_clean.boxplot(column='log_earnk', by='ethnicity', ax=axes[1, 1])
+axes[1, 1].set_title('Earnings by Ethnicity')
+
+plt.tight_layout()
+plt.show()
+```
+
+Age shows a curved relationship. Education shows a positive linear relationship. Males earn more than females. Earnings vary by ethnicity.
+
+**Interpretation:**  
+These plots support using a transformed earnings outcome and show that age, education, gender, and ethnicity are all related to earnings. The complete-case filter does not meaningfully change the sample, and using `log(earnk + 1)` lets me keep the zero-earnings cases instead of dropping them.
+
+## Part B: Height and Weight Confounds
+
+```{python}
+df_hw = df_clean.dropna(subset=['height', 'weight']).copy()
+hw_profile = pd.DataFrame([
+    subset_profile(df_clean, 'clean sample'),
+    subset_profile(df_hw, 'height/weight complete cases')
+]).round(3)
+```
+
+```{python}
+#| output: asis
+
+print(hw_profile.to_string(index=False))
+```
+
+### Separate Models
+
+```{python}
+model_h = ols('log_earnk ~ height', data=df_hw).fit()
+model_w = ols('log_earnk ~ weight', data=df_hw).fit()
+```
+
+Height coefficient: `{python} f"{model_h.params['height']:.4f}"`, 95% CI [`{python} f"{model_h.conf_int().loc['height'][0]:.4f}"`, `{python} f"{model_h.conf_int().loc['height'][1]:.4f}"`]
+
+Weight coefficient: `{python} f"{model_w.params['weight']:.4f}"`, 95% CI [`{python} f"{model_w.conf_int().loc['weight'][0]:.4f}"`, `{python} f"{model_w.conf_int().loc['weight'][1]:.4f}"`]
+
+### Combined Model
+
+```{python}
+model_both = ols('log_earnk ~ height + weight', data=df_hw).fit()
+```
+
+Height coefficient: `{python} f"{model_both.params['height']:.4f}"`
+
+Weight coefficient: `{python} f"{model_both.params['weight']:.4f}"`
+
+```{python}
+plt.figure(figsize=(7, 5))
+plt.scatter(df_hw['height'], df_hw['weight'], alpha=0.25, s=12)
+plt.xlabel('Height')
+plt.ylabel('Weight')
+plt.title('Height and Weight Are Positively Correlated')
+plt.show()
+```
+
+The coefficients change when both variables are in the model together. Height and weight are correlated, so the combined model shows each variable's association with earnings while controlling for the other. The scatterplot above shows why this adjustment matters. I avoid a coefficient bar chart here because height and weight are measured in different units, so the bar lengths are not directly comparable.
+
+Substantively, height is more plausibly upstream of weight than the reverse, so the controlled interpretation is: among respondents of the same height, extra weight is associated with little change or a slightly lower level of log earnings.
+
+**Interpretation:**  
+This is a good example of confounding. When height and weight are modeled separately, each picks up part of the other's association with earnings. Once both are included together, the coefficients shift because the model is now comparing people who are similar on the other body-size measure.
+
+The complete-case restriction for height and weight barely changes the sample profile, so this part of the analysis is less concerning from a selection-bias standpoint than some of the later models.
+
+### Gender as Confound
+
+```{python}
+model_gender = ols('log_earnk ~ height + weight + male', data=df_hw).fit()
+```
+
+With gender added, the coefficients are:
+
+- Height: `{python} f"{model_gender.params['height']:.4f}"`
+- Weight: `{python} f"{model_gender.params['weight']:.4f}"`
+- Male: `{python} f"{model_gender.params['male']:.4f}"`
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+df_hw.boxplot(column='height', by='male', ax=axes[0])
+axes[0].set_title('Height by Gender')
+
+df_hw.boxplot(column='weight', by='male', ax=axes[1])
+axes[1].set_title('Weight by Gender')
+
+df_hw.boxplot(column='log_earnk', by='male', ax=axes[2])
+axes[2].set_title('Earnings by Gender')
+
+plt.tight_layout()
+plt.show()
+```
+
+Gender confounds the relationship because men are taller, heavier, and earn more. Adding gender to the model changes the height and weight coefficients because we're now comparing within gender groups.
+
+**Interpretation:**  
+Gender matters here because it is related to both the predictors and the outcome. After controlling for gender, the height and weight coefficients are better interpreted as within-gender associations rather than broad differences across the whole sample.
+
+## Part C: Education Coefficients
+
+```{python}
+df_edu = df_clean.dropna(subset=['mother_education', 'father_education']).copy()
+edu_profile = pd.DataFrame([
+    subset_profile(df_clean, 'clean sample'),
+    subset_profile(df_edu, 'parent-education complete cases')
+]).round(3)
+```
+
+```{python}
+#| output: asis
+
+print(edu_profile.to_string(index=False))
+```
+
+### Parental Education Only
+
+```{python}
+model_parent = ols('log_earnk ~ mother_education + father_education', 
+                   data=df_edu).fit()
+```
+
+Mother's education: `{python} f"{model_parent.params['mother_education']:.4f}"`
+
+Father's education: `{python} f"{model_parent.params['father_education']:.4f}"`
+
+### Including Respondent's Education
+
+```{python}
+model_all = ols('log_earnk ~ mother_education + father_education + education', 
+                data=df_edu).fit()
+```
+
+Mother's education: `{python} f"{model_all.params['mother_education']:.4f}"`
+
+Father's education: `{python} f"{model_all.params['father_education']:.4f}"`
+
+Respondent's education: `{python} f"{model_all.params['education']:.4f}"`
+
+In the first model, parental education coefficients show the total effect on earnings. When I add respondent's education, the parental coefficients drop substantially. This tells me that parental education mainly affects earnings by helping people get more education themselves. The small remaining effect might be from things like family connections or financial support.
+
+**Interpretation:**  
+The big drop in the parental education coefficients after adding the respondent's own education suggests mediation. In other words, much of the association between parental education and earnings seems to work through the child's educational attainment rather than through a large direct effect by itself.
+
+At the same time, this model uses a smaller subset with non-missing parental education, and that subset is somewhat younger than the full cleaned sample. So the estimates are still informative, but they should be read with some caution because missing parental education may not be random.
+
+## Part D: Potential Colliders
+
+**Health behaviors (walk, exercise, smokenow):** Caused by both earnings (money enables exercise) and education (educated people exercise more). Including these would create bias.
+
+**Mental health (tense, angry):** Caused by earnings (financial stress) and other life factors. Including these would create bias.
+
+**Weight:** Can be a collider because it's influenced by height, gender, and lifestyle factors related to income.
+
+For causal inference, we exclude colliders. For prediction, we may sometimes include them if they improve out-of-sample performance, but they should still be interpreted with caution.
+
+**Interpretation:**  
+These variables highlight the difference between causal modeling and prediction. A variable can be statistically useful in a predictive model and still be inappropriate in a causal analysis if conditioning on it opens a biased path.
+
+# Problem 2: Optimizing a Predictive Model
+
+## Part A: Baseline Model
+
+```{python}
+baseline = ols('log_earnk ~ age + male + education', data=df_clean).fit()
+```
+
+Baseline AIC: `{python} f"{baseline.aic:.2f}"`
+
+**Interpretation:**  
+This baseline gives a simple starting point using age, gender, and education. I use it as the reference point for judging whether added complexity actually improves model fit.
+
+## Part B: Feature Engineering and Variable Selection
+
+### Creating Features
+
+```{python}
+df_pred = df_clean.copy()
+df_pred['age_squared'] = df_pred['age'] ** 2
+df_pred['education_male'] = df_pred['education'] * df_pred['male']
+df_pred['parent_edu_avg'] = df_pred[['mother_education', 
+                                      'father_education']].mean(axis=1)
+
+eth = pd.get_dummies(df_pred['ethnicity'], prefix='eth', drop_first=True)
+df_pred = pd.concat([df_pred, eth], axis=1)
+```
+
+### Age Pattern
+
+```{python}
+age_bins = pd.cut(df_pred['age'], bins=10)
+age_means = df_pred.groupby(age_bins)['log_earnk'].mean()
+
+plt.figure(figsize=(10, 5))
+plt.plot(range(len(age_means)), age_means.values, marker='o')
+plt.xlabel('Age Group')
+plt.ylabel('Mean Log Earnings')
+plt.title('Earnings by Age')
+plt.show()
+```
+
+The plot shows earnings peak in middle age, which is why I included age_squared.
+
+**Interpretation:**  
+The age pattern is clearly nonlinear, so a purely linear age term would miss part of the earnings lifecycle. Adding `age_squared` is a simple way to capture that rise-and-fall pattern.
+
+### Model Comparison
+
+```{python}
+df_compare = df_pred.dropna(subset=['age', 'male', 'education', 'age_squared',
+                                    'education_male', 'eth_Hispanic',
+                                    'eth_Other', 'eth_White', 'parent_edu_avg',
+                                    'height', 'weight', 'walk', 'exercise']).copy()
+compare_profile = pd.DataFrame([
+    subset_profile(df_clean, 'clean sample'),
+    subset_profile(df_compare, 'common comparison sample')
+]).round(3)
+
+models = []
+baseline_compare = ols('log_earnk ~ age + male + education',
+                       data=df_compare).fit()
+models.append(('Baseline', baseline_compare.aic))
+
+m2 = ols('log_earnk ~ age + age_squared + male + education', 
+         data=df_compare).fit()
+models.append(('+ age²', m2.aic))
+
+m3 = ols('log_earnk ~ age + age_squared + male + education + education_male', 
+         data=df_compare).fit()
+models.append(('+ interaction', m3.aic))
+
+m4 = ols('log_earnk ~ age + age_squared + male + education + education_male + '
+         'eth_Hispanic + eth_Other + eth_White', 
+         data=df_compare).fit()
+models.append(('+ ethnicity', m4.aic))
+
+m5 = ols('log_earnk ~ age + age_squared + male + education + education_male + '
+         'eth_Hispanic + eth_Other + eth_White + parent_edu_avg', 
+         data=df_compare).fit()
+models.append(('+ parent edu', m5.aic))
+
+m6 = ols('log_earnk ~ age + age_squared + male + education + education_male + '
+         'eth_Hispanic + eth_Other + eth_White + height + weight', 
+         data=df_compare).fit()
+models.append(('+ height/weight', m6.aic))
+
+m7 = ols('log_earnk ~ age + age_squared + male + education + education_male + '
+         'eth_Hispanic + eth_Other + eth_White + walk + exercise', 
+         data=df_compare).fit()
+models.append(('+ health', m7.aic))
+```
+
+```{python}
+#| output: asis
+
+print(compare_profile.to_string(index=False))
+print("")
+print(f"Model-comparison sample size: {len(df_compare)}")
+print("")
+for name, aic in sorted(models, key=lambda x: x[1]):
+    delta = aic - min([a for _, a in models])
+    print(f"- {name}: AIC = {aic:.2f} (Δ = {delta:.2f})")
+```
+
+To make these AIC comparisons fair, I fit every candidate model on the same complete-case subset `df_compare`. That reduces the sample size, but it avoids comparing AIC values from different datasets.
+
+**Interpretation:**  
+This comparison shows which added features contribute the most once the sample is held fixed. That matters because a lower AIC should reflect a better model, not just a different subset of observations caused by missing data.
+
+The tradeoff is that the common comparison sample is a bit smaller and slightly younger than the full cleaned sample. That does not invalidate the exercise, but it means the final predictive model is being optimized for this observed subset rather than for every respondent in the original file.
+
+### Best Model
+
+```{python}
+best = ols('log_earnk ~ age + age_squared + male + education + education_male + '
+           'eth_Hispanic + eth_Other + eth_White + height + weight + '
+           'parent_edu_avg + walk + exercise', 
+           data=df_compare).fit()
+```
+
+Best model AIC: `{python} f"{best.aic:.2f}"`
+
+AIC improvement relative to baseline on the same sample: `{python} f"{baseline_compare.aic - best.aic:.2f}"`
+
+```{python}
+coef_table = pd.DataFrame({
+    'estimate': best.params,
+    'std_error': best.bse,
+    'p_value': best.pvalues
+}).drop(index='Intercept').round(4)
+```
+
+```{python}
+#| output: asis
+
+print(coef_table.to_string())
+```
+
+I report the final model coefficients as a table rather than a bar chart. Since the predictors use different units and coding schemes, plotting the raw coefficient magnitudes side by side would be misleading.
+
+**Interpretation:**  
+The final model fits the data better than the baseline and captures nonlinear age effects, demographic structure, and some family and behavioral information. But the coefficients should still be read mainly as predictive associations rather than causal effects.
+
+### Multicollinearity Check
+
+```{python}
+X = df_compare[['age', 'age_squared', 'male', 'education', 'education_male',
+                'height', 'weight', 'parent_edu_avg', 'walk', 'exercise',
+                'eth_Hispanic', 'eth_Other', 'eth_White']].astype(float).dropna()
+
+vif = pd.DataFrame({
+    'Variable': X.columns,
+    'VIF': [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]
+}).sort_values('VIF', ascending=False)
+```
+
+```{python}
+#| output: asis
+
+for _, row in vif.head(5).iterrows():
+    print(f"- {row['Variable']}: {row['VIF']:.2f}")
+```
+
+Some variables have high VIF values, especially age and age_squared (which makes sense since they're related). This is intentional to capture the non-linear age pattern. For a predictive model, high VIF is okay since I'm focused on accuracy, not interpreting individual coefficients.
+
+**Variables excluded:** I excluded `smokenow`, `tense`, and `angry` because they are more defensible as post-treatment or collider-type variables in a causal framing, and they did not seem necessary for the predictive model.
+
+**Collinear variables included:** age and age_squared are intentionally included together to capture non-linearity. education and education_male are included to capture the interaction effect.
+
+**Most useful feature:** The age_squared term gave the biggest AIC improvement because it captures how earnings rise and then fall over a career.
+
+**Interpretation:**  
+Multicollinearity is present, but it is not a major problem here because the goal in Problem 2 is prediction rather than clean causal interpretation. The strongest gain came from modeling the nonlinear age pattern, which seems to be one of the main structural features in the data.
+
+# Conclusion
+
+**Problem 1:** Gender confounds height/weight effects on earnings. Parental education affects earnings mostly through enabling respondent's education. Health and mental health variables are colliders.
+
+**Problem 2:** The best predictive model includes non-linear age effects, interactions, ethnicity, physical characteristics, parental education, and health behaviors. In predictive settings, variables that would be problematic in a causal analysis can still be useful, but their coefficients should not be given a causal interpretation.

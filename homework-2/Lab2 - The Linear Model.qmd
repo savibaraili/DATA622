@@ -1,0 +1,372 @@
+---
+title: "Lab 2: The Linear Model"
+author: "Sabina Baraili"
+date: "February 14, 2026"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+jupyter: python3
+---
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.formula.api import ols
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import warnings
+warnings.filterwarnings('ignore')
+
+df = pd.read_csv('earnings.csv')
+```
+
+# Problem 1: Confounds in Earnings Data
+
+## Part A: Exploratory Data Analysis
+
+### Missing Values
+
+I remove rows with missing earnings or education values.
+
+```{python}
+df_clean = df.dropna(subset=['earnk', 'education']).copy()
+df_clean['log_earnk'] = np.log(df_clean['earnk'] + 1)
+```
+
+### Log Transformation Decision
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].hist(df_clean['earnk'], bins=50, edgecolor='black')
+axes[0].set_title('Original Earnings')
+axes[0].set_xlabel('Earnings ($1000s)')
+
+axes[1].hist(df_clean['log_earnk'], bins=50, edgecolor='black')
+axes[1].set_title('Log-Transformed Earnings')
+axes[1].set_xlabel('Log(Earnings + 1)')
+
+plt.tight_layout()
+plt.show()
+```
+
+The original distribution is heavily right-skewed. The log transformation makes it much more symmetric, which works better for linear regression.
+
+**Decision:** I'll use `log_earnk` as my target variable for the rest of this analysis.
+
+### Key Relationships
+
+```{python}
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+axes[0, 0].scatter(df_clean['age'], df_clean['log_earnk'], alpha=0.3, s=10)
+axes[0, 0].set_title('Age vs Log Earnings')
+
+axes[0, 1].scatter(df_clean['education'], df_clean['log_earnk'], alpha=0.3, s=10)
+axes[0, 1].set_title('Education vs Log Earnings')
+
+df_clean.boxplot(column='log_earnk', by='male', ax=axes[1, 0])
+axes[1, 0].set_title('Earnings by Gender')
+
+df_clean.boxplot(column='log_earnk', by='ethnicity', ax=axes[1, 1])
+axes[1, 1].set_title('Earnings by Ethnicity')
+
+plt.tight_layout()
+plt.show()
+```
+
+Age shows a curved relationship. Education shows a positive linear relationship. Males earn more than females. Earnings vary by ethnicity.
+
+## Part B: Height and Weight Confounds
+
+```{python}
+df_hw = df_clean.dropna(subset=['height', 'weight']).copy()
+```
+
+### Separate Models
+
+```{python}
+model_h = ols('log_earnk ~ height', data=df_hw).fit()
+model_w = ols('log_earnk ~ weight', data=df_hw).fit()
+```
+
+Height coefficient: `{python} f"{model_h.params['height']:.4f}"`, 95% CI [`{python} f"{model_h.conf_int().loc['height'][0]:.4f}"`, `{python} f"{model_h.conf_int().loc['height'][1]:.4f}"`]
+
+Weight coefficient: `{python} f"{model_w.params['weight']:.4f}"`, 95% CI [`{python} f"{model_w.conf_int().loc['weight'][0]:.4f}"`, `{python} f"{model_w.conf_int().loc['weight'][1]:.4f}"`]
+
+### Combined Model
+
+```{python}
+model_both = ols('log_earnk ~ height + weight', data=df_hw).fit()
+```
+
+Height coefficient: `{python} f"{model_both.params['height']:.4f}"`
+
+Weight coefficient: `{python} f"{model_both.params['weight']:.4f}"`
+
+```{python}
+fig, ax = plt.subplots(figsize=(10, 5))
+
+vars = ['Height', 'Weight']
+sep = [model_h.params['height'], model_w.params['weight']]
+comb = [model_both.params['height'], model_both.params['weight']]
+
+x = np.arange(2)
+ax.bar(x - 0.2, sep, 0.4, label='Separate')
+ax.bar(x + 0.2, comb, 0.4, label='Combined')
+ax.set_xticks(x)
+ax.set_xticklabels(vars)
+ax.legend()
+ax.axhline(0, color='black', linestyle='--')
+plt.title('Coefficient Comparison')
+plt.show()
+```
+
+The coefficients change when both variables are in the model together. Height and weight are correlated, so the combined model shows each effect while controlling for the other. Interestingly, the weight coefficient becomes close to zero or negative, which suggests that among people of the same height, being heavier doesn't help earnings (and might even hurt).
+
+### Gender as Confound
+
+```{python}
+model_gender = ols('log_earnk ~ height + weight + male', data=df_hw).fit()
+```
+
+With gender added, the coefficients are:
+
+- Height: `{python} f"{model_gender.params['height']:.4f}"`
+- Weight: `{python} f"{model_gender.params['weight']:.4f}"`
+- Male: `{python} f"{model_gender.params['male']:.4f}"`
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+df_hw.boxplot(column='height', by='male', ax=axes[0])
+axes[0].set_title('Height by Gender')
+
+df_hw.boxplot(column='weight', by='male', ax=axes[1])
+axes[1].set_title('Weight by Gender')
+
+df_hw.boxplot(column='log_earnk', by='male', ax=axes[2])
+axes[2].set_title('Earnings by Gender')
+
+plt.tight_layout()
+plt.show()
+```
+
+Gender confounds the relationship because men are taller, heavier, and earn more. Adding gender to the model changes the height and weight coefficients because we're now comparing within gender groups.
+
+## Part C: Education Coefficients
+
+```{python}
+df_edu = df_clean.dropna(subset=['mother_education', 'father_education']).copy()
+```
+
+### Parental Education Only
+
+```{python}
+model_parent = ols('log_earnk ~ mother_education + father_education', 
+                   data=df_edu).fit()
+```
+
+Mother's education: `{python} f"{model_parent.params['mother_education']:.4f}"`
+
+Father's education: `{python} f"{model_parent.params['father_education']:.4f}"`
+
+### Including Respondent's Education
+
+```{python}
+model_all = ols('log_earnk ~ mother_education + father_education + education', 
+                data=df_edu).fit()
+```
+
+Mother's education: `{python} f"{model_all.params['mother_education']:.4f}"`
+
+Father's education: `{python} f"{model_all.params['father_education']:.4f}"`
+
+Respondent's education: `{python} f"{model_all.params['education']:.4f}"`
+
+```{python}
+fig, ax = plt.subplots(figsize=(10, 5))
+
+vars = ['Mother Edu', 'Father Edu', 'Respondent Edu']
+m1 = [model_parent.params['mother_education'], 
+      model_parent.params['father_education'], 0]
+m2 = [model_all.params['mother_education'], 
+      model_all.params['father_education'], 
+      model_all.params['education']]
+
+x = np.arange(3)
+ax.bar(x - 0.2, m1, 0.4, label='Parents Only')
+ax.bar(x + 0.2, m2, 0.4, label='Parents + Respondent')
+ax.set_xticks(x)
+ax.set_xticklabels(vars)
+ax.legend()
+ax.axhline(0, color='black', linestyle='--')
+plt.title('Education Coefficients')
+plt.show()
+```
+
+In the first model, parental education coefficients show the total effect on earnings. When I add respondent's education, the parental coefficients drop substantially. This tells me that parental education mainly affects earnings by helping people get more education themselves. The small remaining effect might be from things like family connections or financial support.
+
+## Part D: Potential Colliders
+
+**Health behaviors (walk, exercise, smokenow):** Caused by both earnings (money enables exercise) and education (educated people exercise more). Including these would create bias.
+
+**Mental health (tense, angry):** Caused by earnings (financial stress) and other life factors. Including these would create bias.
+
+**Weight:** Can be a collider because it's influenced by height, gender, and lifestyle factors related to income.
+
+For causal inference, we exclude colliders. For prediction, we can include them.
+
+# Problem 2: Optimizing a Predictive Model
+
+## Part A: Baseline Model
+
+```{python}
+baseline = ols('log_earnk ~ age + male + education', data=df_clean).fit()
+```
+
+Baseline AIC: `{python} f"{baseline.aic:.2f}"`
+
+## Part B: Feature Engineering and Variable Selection
+
+### Creating Features
+
+```{python}
+df_pred = df_clean.copy()
+df_pred['age_squared'] = df_pred['age'] ** 2
+df_pred['education_male'] = df_pred['education'] * df_pred['male']
+df_pred['parent_edu_avg'] = df_pred[['mother_education', 
+                                      'father_education']].mean(axis=1)
+
+eth = pd.get_dummies(df_pred['ethnicity'], prefix='eth', drop_first=True)
+df_pred = pd.concat([df_pred, eth], axis=1)
+```
+
+### Age Pattern
+
+```{python}
+age_bins = pd.cut(df_pred['age'], bins=10)
+age_means = df_pred.groupby(age_bins)['log_earnk'].mean()
+
+plt.figure(figsize=(10, 5))
+plt.plot(range(len(age_means)), age_means.values, marker='o')
+plt.xlabel('Age Group')
+plt.ylabel('Mean Log Earnings')
+plt.title('Earnings by Age')
+plt.show()
+```
+
+The plot shows earnings peak in middle age, which is why I included age_squared.
+
+### Model Comparison
+
+```{python}
+models = []
+models.append(('Baseline', baseline.aic))
+
+m2 = ols('log_earnk ~ age + age_squared + male + education', 
+         data=df_pred).fit()
+models.append(('+ age²', m2.aic))
+
+m3 = ols('log_earnk ~ age + age_squared + male + education + education_male', 
+         data=df_pred).fit()
+models.append(('+ interaction', m3.aic))
+
+m4 = ols('log_earnk ~ age + age_squared + male + education + education_male + '
+         'eth_Hispanic + eth_Other + eth_White', 
+         data=df_pred).fit()
+models.append(('+ ethnicity', m4.aic))
+
+df_temp = df_pred.dropna(subset=['parent_edu_avg'])
+m5 = ols('log_earnk ~ age + age_squared + male + education + education_male + '
+         'eth_Hispanic + eth_Other + eth_White + parent_edu_avg', 
+         data=df_temp).fit()
+models.append(('+ parent edu', m5.aic))
+
+df_temp = df_pred.dropna(subset=['height', 'weight'])
+m6 = ols('log_earnk ~ age + age_squared + male + education + education_male + '
+         'eth_Hispanic + eth_Other + eth_White + height + weight', 
+         data=df_temp).fit()
+models.append(('+ height/weight', m6.aic))
+
+df_temp = df_pred.dropna(subset=['walk', 'exercise'])
+m7 = ols('log_earnk ~ age + age_squared + male + education + education_male + '
+         'eth_Hispanic + eth_Other + eth_White + walk + exercise', 
+         data=df_temp).fit()
+models.append(('+ health', m7.aic))
+```
+
+```{python}
+#| output: asis
+
+for name, aic in sorted(models, key=lambda x: x[1]):
+    delta = aic - min([a for _, a in models])
+    print(f"- {name}: AIC = {aic:.2f} (Δ = {delta:.2f})")
+```
+
+### Best Model
+
+```{python}
+df_best = df_pred.dropna(subset=['height', 'weight', 'parent_edu_avg', 
+                                  'walk', 'exercise'])
+
+best = ols('log_earnk ~ age + age_squared + male + education + education_male + '
+           'eth_Hispanic + eth_Other + eth_White + height + weight + '
+           'parent_edu_avg + walk + exercise', 
+           data=df_best).fit()
+```
+
+Best model AIC: `{python} f"{best.aic:.2f}"`
+
+AIC improvement: `{python} f"{baseline.aic - best.aic:.2f}"`
+
+```{python}
+plt.figure(figsize=(10, 8))
+
+coefs = best.params[1:]  # Exclude intercept
+colors = ['red' if p < 0.05 else 'gray' for p in best.pvalues[1:]]
+
+plt.barh(range(len(coefs)), coefs.values, color=colors)
+plt.yticks(range(len(coefs)), coefs.index)
+plt.axvline(0, color='black')
+plt.xlabel('Coefficient')
+plt.title('Best Model Coefficients (Red = p<0.05)')
+plt.tight_layout()
+plt.show()
+```
+
+### Multicollinearity Check
+
+```{python}
+X = df_best[['age', 'age_squared', 'male', 'education', 'education_male',
+             'height', 'weight', 'parent_edu_avg', 'walk', 'exercise',
+             'eth_Hispanic', 'eth_Other', 'eth_White']].astype(float).dropna()
+
+vif = pd.DataFrame({
+    'Variable': X.columns,
+    'VIF': [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]
+}).sort_values('VIF', ascending=False)
+```
+
+```{python}
+#| output: asis
+
+for _, row in vif.head(5).iterrows():
+    print(f"- {row['Variable']}: {row['VIF']:.2f}")
+```
+
+Some variables have high VIF values, especially age and age_squared (which makes sense since they're related). This is intentional to capture the non-linear age pattern. For a predictive model, high VIF is okay since I'm focused on accuracy, not interpreting individual coefficients.
+
+**Variables excluded:** I excluded smokenow, tense, and angry because they are colliders with limited predictive value.
+
+**Collinear variables included:** age and age_squared are intentionally included together to capture non-linearity. education and education_male are included to capture the interaction effect.
+
+**Most useful feature:** The age_squared term gave the biggest AIC improvement because it captures how earnings rise and then fall over a career.
+
+# Conclusion
+
+**Problem 1:** Gender confounds height/weight effects on earnings. Parental education affects earnings mostly through enabling respondent's education. Health and mental health variables are colliders.
+
+**Problem 2:** The best predictive model includes non-linear age effects, interactions, ethnicity, physical characteristics, parental education, and health behaviors. For prediction we include colliders; for causal inference we exclude them.
